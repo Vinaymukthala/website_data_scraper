@@ -75,7 +75,19 @@ const ACCESSORY_KEYWORDS = [
 
 function isAccessory(title) {
   const upper = (title || "").toUpperCase();
-  return ACCESSORY_KEYWORDS.some(kw => upper.includes(kw));
+  if (ACCESSORY_KEYWORDS.some(kw => upper.includes(kw))) return true;
+
+  // Custom standalone match for "BARREL" and parts without accidentally filtering out 
+  // valid guns with descriptions like "4 INCH BARREL"
+  if (/\b(BARREL|BARRELS|RECEIVER|SLIDE|UPPER|LOWER|CHOKE|CHOKES|PARTS)\b/.test(upper)) {
+    // If it contains barrel but also says "INCH BARREL", "IN BARREL", or "EXTRA BARREL", it is mostly likely a gun
+    if (/\b(INCH\s+BARREL|IN\s+BARREL|" BARREL|'' BARREL|EXTRA\s+BARREL)\b/.test(upper)) {
+      return false;
+    }
+    return true; 
+  }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +168,12 @@ async function collectListingUrls(page) {
         const blueM = t.match(/^Blue:\s*(.+)/i);
         const boreM = t.match(/^Bore:\s*(.+)/i);
         const barrelM = t.match(/^Barrel:\s*(.+)/i);
+        const stockM = t.match(/^Stock:\s*(.+)/i);
         if (calM) specs.caliber = calM[1].trim();
         if (blueM) specs.blue = blueM[1].trim();
         if (boreM) specs.bore = boreM[1].trim();
         if (barrelM) specs.barrel = barrelM[1].trim();
+        if (stockM) specs.stock = stockM[1].trim();
       }
 
       out.push({ href, rawTitle, priceText, specs });
@@ -222,6 +236,7 @@ async function scrapeDetailPage(page, href) {
       { key: "caliber", re: /\bCal(?:iber)?:\s*([^\n\r,]+)/i },
       { key: "barrel",  re: /\bBarrel:\s*([^\n\r,]+)/i },
       { key: "action",  re: /\bAction:\s*([^\n\r,]+)/i },
+      { key: "stock",   re: /\bStock:\s*([^\n\r,]+)/i },
     ];
     for (const { key, re } of specPatterns) {
       const m = bodyText.match(re);
@@ -229,8 +244,12 @@ async function scrapeDetailPage(page, href) {
     }
 
     const conditionParts = [];
-    if (specs.blue)   conditionParts.push(`Blue: ${specs.blue}`);
-    if (specs.bore)   conditionParts.push(`Bore: ${specs.bore}`);
+    if (specs.stock) conditionParts.push(specs.stock);
+    
+    if (conditionParts.length === 0) {
+      if (specs.blue)   conditionParts.push(`Blue: ${specs.blue}`);
+      if (specs.bore)   conditionParts.push(`Bore: ${specs.bore}`);
+    }
     const condition = conditionParts.join(", ") || "Unknown";
 
     return { title, sku, priceText, condition, specs, pageUrl };
@@ -268,10 +287,12 @@ export async function scrape({ page, query }) {
   const beforeFilter = listings.length;
   listings = listings.filter(l => {
     const title = cleanTitle(l.rawTitle);
+    console.log(`[DEBUG simpsonltd] Evaluating title: "${title}"`);
     if (isAccessory(title)) {
       console.log(`[${sourceName}] Skipping accessory: "${title}"`);
       return false;
     }
+    console.log(`[DEBUG simpsonltd] PASSED: "${title}"`);
     return true;
   });
   console.log(`[${sourceName}] Filtered: ${beforeFilter} → ${listings.length} (removed ${beforeFilter - listings.length} accessories)`);
@@ -312,7 +333,7 @@ export async function scrape({ page, query }) {
       const title = cleanTitle(p.rawTitle);
       return {
         sourceName,
-        condition: conditionFromText(title),
+        condition: p.specs.stock || conditionFromText(title) || "Unknown",
         pageUrl,
         gunName: title || null,
         specs: p.specs || {},

@@ -136,11 +136,13 @@ async function scrapeFirearm(input) {
 
   const errors = {};
   const allRows = [];
+  const providerLatencies = [];
 
   try {
     const settled = await Promise.allSettled(
       PROVIDERS.map(async (provider) => {
         const page = await browser.newPage();
+        const startTime = Date.now();
 
         try {
           const rows = await withTimeout(
@@ -156,12 +158,14 @@ async function scrapeFirearm(input) {
           return {
             name: provider.sourceName,
             rows: Array.isArray(rows) ? rows : [],
+            latencyMs: Date.now() - startTime
           };
         } catch (error) {
           return {
             name: provider.sourceName,
             rows: [],
             error,
+            latencyMs: Date.now() - startTime
           };
         } finally {
           await page.close().catch(() => { });
@@ -183,9 +187,17 @@ async function scrapeFirearm(input) {
         errors[value.name] = "No results";
       }
 
+      providerLatencies.push({ name: value.name, ms: value.latencyMs });
+
       for (const row of value.rows || []) {
         allRows.push(row);
       }
+    }
+
+    if (process.env.TRACK_LATENCY === 'true' && providerLatencies.length > 0) {
+      console.log(`\n--- Latency Tracking for: ${QUERY} ---`);
+      providerLatencies.forEach(p => console.log(`  ${p.name}: ${p.ms}ms`));
+      console.log(`------------------------------------------------`);
     }
   } finally {
     await browser.close().catch(() => { });

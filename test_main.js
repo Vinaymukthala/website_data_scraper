@@ -1,5 +1,10 @@
 import { scrapeFirearm } from './main.js';
 
+// --- TEMPORARY FEATURE TOGGLE ---
+// Change to 'false' to disable website latency tracking
+process.env.TRACK_LATENCY = 'true';
+// --------------------------------
+
 const inputRaw = {
   "quickQuoteRequest": {
     "appraisalID": "A0001",
@@ -9,13 +14,7 @@ const inputRaw = {
     "location": {
       "locationId": "001"
     },
-    "firearm": {
-      "firearmType": "SHOTGUN",
-      "serial": "SN44397853",
-      "brand": "BERETTA",
-      "model": "DT10 TRIDENT SPORTING",
-      "caliber": "12GA"
-    }
+    "firearm": { firearmType: "SHOTGUN", brand: "REMINGTON", model: "870", caliber: "12GA" }
   }
 };
 

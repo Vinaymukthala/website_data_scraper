@@ -21,7 +21,21 @@ const SEARCH_CATEGORY = { HANDGUN: "Pistols", RIFLE: "Rifles", SHOTGUN: "Shotgun
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-const ACCESSORY_RE = /MAGAZINE|HOLSTER|GRIP[S ]|SCOPE|OPTIC|SLING|CLEANING|AMMO|BAYONET|CASE |PARTS KIT|MANUAL|BOOK /i;
+const ACCESSORY_RE = /MAGAZINE|HOLSTER|GRIP[S ]|SCOPE|OPTIC|SLING|CLEANING|AMMO|BAYONET|CASE |PARTS KIT|MANUAL|BOOK |CONVERSION KIT|LOADER|LASER|FLASHLIGHT|SUPPRESSOR|SILENCER|KNIFE/i;
+
+function isAccessory(title) {
+  const upper = (title || "").toUpperCase();
+  if (ACCESSORY_RE.test(upper)) return true;
+
+  // Custom standalone match for "BARREL" and parts without blocking valid guns like "4 INCH BARREL"
+  if (/\b(BARREL|BARRELS|RECEIVER|SLIDE|UPPER|LOWER|CHOKE|CHOKES|PARTS)\b/.test(upper)) {
+    if (/\b(INCH\s+BARREL|IN\s+BARREL|" BARREL|'' BARREL|EXTRA\s+BARREL)\b/.test(upper)) {
+      return false;
+    }
+    return true; 
+  }
+  return false;
+}
 
 const CALIBRE_NOISE = new Set([
   "MM", "LUGER", "ACP", "AUTO", "MAG", "MAGNUM", "SPECIAL", "WIN",
@@ -170,7 +184,7 @@ export async function scrape({ page, query, firearmType }) {
 
   let listings = raw
     .filter(l => !NAV_RE.test(l.url))
-    .filter(l => !ACCESSORY_RE.test(l.title));
+    .filter(l => !isAccessory(l.title));
 
   // Relevance filter (progressive)
   let relevant = listings.filter(l => matchCount(l.title, keywords) >= minMatch);
