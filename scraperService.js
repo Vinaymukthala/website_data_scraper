@@ -1,24 +1,8 @@
 /**
- * Firearm price scraper — single entry point.
+ * Firearm price scraper service.
  *
  * Exports:
  *   scrapeFirearm(input) → { query, sources, offerValue, errors, _meta }
- *
- * Usage as module:
- *   import { scrapeFirearm } from "./index.js";
- *   const result = await scrapeFirearm({
- *     firearmType: "SHOTGUN", brand: "BERETTA",
- *     model: "DT10 TRIDENT SPORTING", caliber: "12GA",
- *   });
- *
- * Usage as CLI:
- *   node index.js                        # reads input_payload.json
- *   node index.js --json '{ ... }'       # inline JSON input
- *
- * Env:
- *   HEADLESS=false                        Show browser window
- *   PUPPETEER_EXECUTABLE_PATH=...         Chrome path
- *   SCRAPE_TIMEOUT_MS=10000               Per-provider timeout (default 10s)
  */
 
 import path from "node:path";
@@ -37,7 +21,7 @@ import * as simpsonltd from "./scripts/providers/simpsonltd.js";
 
 const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd];
 
-// ── Puppeteer setup (one-time) ───────────────────────────────────────────────
+// ── Puppeteer setup ──────────────────────────────────────────────────────────
 
 puppeteerExtra.use(StealthPlugin());
 puppeteerExtra.use(AnonymizeUAPlugin({ makeWindows: false }));
@@ -58,24 +42,28 @@ const BROWSER_ARGS = [
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Race a promise against a timeout. */
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      const e = new Error(`Timeout ${ms}ms (${label})`);
-      e.name = "TimeoutError";
-      reject(e);
+      const error = new Error(`Timeout ${ms}ms (${label})`);
+      error.name = "TimeoutError";
+      reject(error);
     }, ms);
+
     promise.then(resolve, reject).finally(() => clearTimeout(timer));
   });
 }
 
-/** Normalize a single provider row into the output schema. */
 function normalizeRow(row, brand, caliber) {
   const price = row?.price?.original;
-  if (typeof price !== "number" || !Number.isFinite(price)) return null;
+  if (typeof price !== "number" || !Number.isFinite(price)) {
+    return null;
+  }
+
   const pageUrl = row?.pageUrl ? String(row.pageUrl) : null;
-  if (!pageUrl) return null;
+  if (!pageUrl) {
+    return null;
+  }
 
   return {
     sourceId: "000",
@@ -85,13 +73,16 @@ function normalizeRow(row, brand, caliber) {
     gunName: row.gunName ? String(row.gunName) : null,
     brand,
     caliber,
-    price: { currency: "USD", original: price },
+    price: {
+      currency: "USD",
+      original: price,
+    },
   };
 }
 
-/** Compute min/max offer range from normalized sources. */
 function computeOfferValue(sources) {
-  const prices = sources.map(s => s.price.original);
+  const prices = sources.map((source) => source.price.original);
+
   return {
     min: prices.length ? Math.min(...prices) : null,
     max: prices.length ? Math.max(...prices) : null,
@@ -99,12 +90,17 @@ function computeOfferValue(sources) {
   };
 }
 
+function validateInput(input) {
+  const { firearmType, brand, model, caliber } = input || {};
+
+  if (!firearmType || !brand || !model || !caliber) {
+    throw new Error("Input must include firearmType, brand, model, and caliber");
+  }
+}
+
 // ── Core API ─────────────────────────────────────────────────────────────────
 
 /**
- * Scrape firearm prices from all registered providers.
- * Pure function — no file I/O. Takes input, returns output.
- *
  * @param {{ firearmType: string, brand: string, model: string, caliber: string }} input
  * @returns {Promise<{
  *   query: object,
@@ -114,23 +110,20 @@ function computeOfferValue(sources) {
  *   _meta: { durationMs: number, providers: number, results: number }
  * }>}
  */
-export async function scrapeFirearm(input) {
-  const { firearmType, brand, model, caliber } = input;
-  if (!firearmType || !brand || !model || !caliber) {
-    throw new Error("Input must include firearmType, brand, model, and caliber");
-  }
+async function scrapeFirearm(input) {
+  validateInput(input);
 
-  const BRAND = String(brand).trim();
-  const MODEL = String(model).trim();
-  const CALIBER = String(caliber).trim();
-  const TYPE = String(firearmType).trim();
+  const BRAND = String(input.brand).trim();
+  const MODEL = String(input.model).trim();
+  const CALIBER = String(input.caliber).trim();
+  const TYPE = String(input.firearmType).trim();
   const QUERY = [BRAND, MODEL, CALIBER].join(" ");
 
   const headless = process.env.HEADLESS !== "false";
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH?.trim() || undefined;
-  const timeoutMs = Number(process.env.SCRAPE_TIMEOUT_MS) || 10_000;
+  const timeoutMs = Number(process.env.SCRAPE_TIMEOUT_MS) || 10000;
 
-  const t0 = Date.now();
+  const startedAt = Date.now();
 
   const browser = await puppeteerExtra.launch({
     headless,
@@ -148,74 +141,115 @@ export async function scrapeFirearm(input) {
     const settled = await Promise.allSettled(
       PROVIDERS.map(async (provider) => {
         const page = await browser.newPage();
+
         try {
           const rows = await withTimeout(
-            provider.scrape({ page, query: QUERY, firearmType: TYPE }),
+            provider.scrape({
+              page,
+              query: QUERY,
+              firearmType: TYPE,
+            }),
             timeoutMs,
-            provider.sourceName,
+            provider.sourceName
           );
-          return { name: provider.sourceName, rows: Array.isArray(rows) ? rows : [] };
-        } catch (err) {
-          return { name: provider.sourceName, rows: [], error: err };
+
+          return {
+            name: provider.sourceName,
+            rows: Array.isArray(rows) ? rows : [],
+          };
+        } catch (error) {
+          return {
+            name: provider.sourceName,
+            rows: [],
+            error,
+          };
         } finally {
           await page.close().catch(() => { });
         }
-      }),
+      })
     );
 
     for (const result of settled) {
-      const val = result.status === "fulfilled"
-        ? result.value
-        : { name: "unknown", rows: [], error: result.reason };
+      const value =
+        result.status === "fulfilled"
+          ? result.value
+          : { name: "unknown", rows: [], error: result.reason };
 
-      if (val.error) errors[val.name] = val.error?.message || String(val.error);
-      if (!val.rows?.length && !val.error) errors[val.name] = "No results";
-      for (const row of val.rows || []) allRows.push(row);
+      if (value.error) {
+        errors[value.name] = value.error?.message || String(value.error);
+      }
+
+      if (!value.rows?.length && !value.error) {
+        errors[value.name] = "No results";
+      }
+
+      for (const row of value.rows || []) {
+        allRows.push(row);
+      }
     }
   } finally {
     await browser.close().catch(() => { });
   }
 
-  // Normalize, sort by price, assign sequential IDs
   const sources = allRows
-    .map(row => normalizeRow(row, BRAND, CALIBER))
+    .map((row) => normalizeRow(row, BRAND, CALIBER))
     .filter(Boolean)
     .sort((a, b) => a.price.original - b.price.original);
 
-  sources.forEach((s, i) => { s.sourceId = String(i + 1).padStart(3, "0"); });
+  sources.forEach((source, index) => {
+    source.sourceId = String(index + 1).padStart(3, "0");
+  });
 
   return {
-    query: { firearmType: TYPE, brand: BRAND, model: MODEL, caliber: CALIBER, searchQuery: QUERY },
+    query: {
+      firearmType: TYPE,
+      brand: BRAND,
+      model: MODEL,
+      caliber: CALIBER,
+      searchQuery: QUERY,
+    },
     sources,
     offerValue: computeOfferValue(sources),
     errors,
-    _meta: { durationMs: Date.now() - t0, providers: PROVIDERS.length, results: sources.length },
+    _meta: {
+      durationMs: Date.now() - startedAt,
+      providers: PROVIDERS.length,
+      results: sources.length,
+    },
   };
 }
+
+export { scrapeFirearm };
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const isCLI = process.argv[1]
-  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+const isCLI =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 if (isCLI) {
   (async () => {
     let input;
-    const jsonIdx = process.argv.indexOf("--json");
-    if (jsonIdx !== -1 && process.argv[jsonIdx + 1]) {
-      input = JSON.parse(process.argv[jsonIdx + 1]);
+    const jsonIndex = process.argv.indexOf("--json");
+
+    if (jsonIndex !== -1 && process.argv[jsonIndex + 1]) {
+      input = JSON.parse(process.argv[jsonIndex + 1]);
     } else {
       const payloadPath = path.join(__dirname, "input_payload.json");
       const raw = JSON.parse(await fs.readFile(payloadPath, "utf8"));
       input = raw.quickQuoteRequest?.firearm;
     }
 
-    if (!input) { console.error("No input found."); process.exit(1); }
+    if (!input) {
+      console.error("No input found.");
+      process.exit(1);
+    }
 
     const result = await scrapeFirearm(input);
-
-    // Output to stdout — no file creation
     console.log(JSON.stringify(result, null, 2));
-  })().catch(e => { console.error(e); process.exit(1); });
+  })().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
 }
