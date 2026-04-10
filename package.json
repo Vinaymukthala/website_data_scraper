@@ -3,9 +3,9 @@
   "private": true,
   "version": "3.0.0",
   "type": "module",
-  "main": "./index.js",
+  "main": "./test_main.js",
   "scripts": {
-    "start": "node ./index.js"
+    "start": "node test_main.js"
   },
   "dependencies": {
     "puppeteer": "^24.0.0",
