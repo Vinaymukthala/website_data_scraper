@@ -18,8 +18,9 @@ import AnonymizeUAPlugin from "puppeteer-extra-plugin-anonymize-ua";
 import * as truegunvalue from "./scripts/providers/truegunvalue.js";
 import * as gunsinternational from "./scripts/providers/gunsinternational.js";
 import * as simpsonltd from "./scripts/providers/simpsonltd.js";
+import * as collectorfirearms from "./scripts/providers/collectorfirearms.js";
 
-const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd];
+const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd, collectorfirearms];
 
 // ── Puppeteer setup ──────────────────────────────────────────────────────────
 

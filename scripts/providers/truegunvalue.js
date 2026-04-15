@@ -20,19 +20,67 @@ function trueGunValueResultsUrl(categoryValue, query) {
   return new URL(pathPart, "https://truegunvalue.com/").href;
 }
 
-function listingsFromScrapedText(text) {
+/**
+ * Parse sold listing blocks from the page text.
+ * Each sold item has structured fields like:
+ *   PRICE: $469.00    MANUFACTURER: GLOCK
+ *   CONDITION: Used    MODEL: G19
+ *   SOLD: 4/14/2026   UPC: ...
+ *   CALIBER: 9MM LUGER
+ *
+ * We extract each block and validate the MODEL field against the searched model
+ * to filter out unrelated guns (e.g. G26, G17 when searching for G19).
+ */
+function listingsFromScrapedText(text, searchModel) {
   const lines = String(text || "").split(/\n/);
   const out = [];
+
+  // Normalize the search model for flexible matching
+  // "19" should match "G19", "19 GEN5", "G19 GEN5", etc.
+  const modelNorm = String(searchModel || "").trim().toUpperCase();
+  // Strip leading letters like "G" from "G19" to get core digits
+  const modelBase = modelNorm.replace(/^[A-Z]+/, "") || modelNorm;
+
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^PRICE:\s*(.+)$/);
-    if (!m) continue;
-    const price = parseUsdPrice(m[1]);
+    const priceMatch = lines[i].match(/^PRICE:\s*(.+)$/);
+    if (!priceMatch) continue;
+
+    const price = parseUsdPrice(priceMatch[1]);
     if (price == null) continue;
-    const chunk = [lines[i], lines[i + 1], lines[i + 2], lines[i + 3]].filter(Boolean).join("\n");
+
+    // Grab the next several lines to form the full listing block
+    const chunk = lines.slice(i, Math.min(i + 8, lines.length)).join("\n");
+
+    // Extract condition
     let condition = "Unknown";
     const cMatch = chunk.match(/CONDITION:\s*([^\t\r\n]+)/);
     if (cMatch) condition = cMatch[1].trim();
-    out.push({ price, condition });
+
+    // Extract model — this is the KEY filter
+    let model = "";
+    const mMatch = chunk.match(/MODEL:\s*([^\t\r\n]+)/);
+    if (mMatch) model = mMatch[1].trim().toUpperCase();
+
+    // Validate: model must contain the searched model number
+    // e.g. searching "19" should match "G19", "G19 GEN5", "19 GEN4"
+    //       but NOT "G17", "G26", "G43"
+    if (model && modelBase) {
+      const modelClean = model.replace(/^G/, ""); // "G19 GEN5" → "19 GEN5"
+      if (!modelClean.startsWith(modelBase) && !model.includes(modelNorm)) {
+        continue; // Different gun model — skip
+      }
+    }
+
+    // Extract the title line (usually 1-2 lines before the PRICE line)
+    let title = "";
+    if (i >= 1) {
+      const prevLine = lines[i - 1].trim();
+      if (prevLine.length > 5 && !prevLine.startsWith("PRICE:") && !prevLine.startsWith("CONDITION:")) {
+        title = prevLine;
+      }
+    }
+
+    out.push({ price, condition, model, title });
   }
   return out;
 }
@@ -57,6 +105,11 @@ export async function scrape({ page, query, firearmType }) {
   const categoryValue = CATEGORY_SELECT_VALUE[categoryKey];
   const pdpUrl = trueGunValueResultsUrl(categoryValue, query);
 
+  // Extract the model from the query for filtering
+  // query is typically "GLOCK 19 9MM" — the model is the middle part(s)
+  const queryParts = query.split(/\s+/);
+  const searchModel = queryParts.length >= 2 ? queryParts.slice(1, -1).join(" ") : "";
+
   await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 10_000 });
   await ensureNotBlocked(page, `${sourceName}: after navigation`);
 
@@ -66,13 +119,15 @@ export async function scrape({ page, query, firearmType }) {
     return (root.innerText || "").trim();
   });
 
-  const listings = listingsFromScrapedText(text);
-  return listings.map((l) => ({
+  const allListings = listingsFromScrapedText(text, searchModel);
+  console.log(`[${sourceName}] Parsed ${allListings.length} matching listing(s) (model filter: "${searchModel}").`);
+
+  return allListings.map((l) => ({
     sourceName,
     condition: l.condition || "Unknown",
     conditionType: conditionTypeFromCondition(l.condition),
     pageUrl: pdpUrl,
-    gunName: null,
+    gunName: l.title || null,
     price: { currency: "USD", original: l.price },
   }));
 }

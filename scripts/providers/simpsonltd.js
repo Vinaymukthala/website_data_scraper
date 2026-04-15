@@ -287,12 +287,10 @@ export async function scrape({ page, query }) {
   const beforeFilter = listings.length;
   listings = listings.filter(l => {
     const title = cleanTitle(l.rawTitle);
-    console.log(`[DEBUG simpsonltd] Evaluating title: "${title}"`);
     if (isAccessory(title)) {
       console.log(`[${sourceName}] Skipping accessory: "${title}"`);
       return false;
     }
-    console.log(`[DEBUG simpsonltd] PASSED: "${title}"`);
     return true;
   });
   console.log(`[${sourceName}] Filtered: ${beforeFilter} → ${listings.length} (removed ${beforeFilter - listings.length} accessories)`);
