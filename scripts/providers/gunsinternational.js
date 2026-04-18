@@ -75,6 +75,17 @@ export async function scrape({ page, query, firearmType }) {
     expires: Math.floor(Date.now() / 1000) + 365 * 86400,
   });
 
+  // Block heavy assets — significantly reduces page load time
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const type = req.resourceType();
+    if (["image", "stylesheet", "font", "media", "other"].includes(type)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
   // Navigate — domcontentloaded fires fast; listing data is server-rendered HTML
   await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 12_000 });
 
@@ -84,12 +95,8 @@ export async function scrape({ page, query, firearmType }) {
   ).catch(() => false);
 
   if (blocked) {
-    console.warn(`[${sourceName}] Cloudflare blocked — waiting 5s…`);
-    await delay(5000);
-    const still = await page.evaluate(() =>
-      /just a moment|cloudflare/i.test(document.title)
-    ).catch(() => true);
-    if (still) { console.warn(`[${sourceName}] Still blocked.`); return []; }
+    console.warn(`[${sourceName}] Cloudflare blocked — skipping.`);
+    return [];
   }
 
   // Dismiss age gate if cookie didn't work
@@ -103,12 +110,12 @@ export async function scrape({ page, query, firearmType }) {
     document.cookie = "alertID_age2=age2;expires=" + d.toUTCString() + ";path=/";
   }).catch(() => {});
 
-  // Wait for listing elements — deferred JS needs a few seconds after DOM load
+  // Wait for listing elements
   await page.waitForFunction(
     () => document.querySelectorAll(".listing_guts, a[href*='gun_id=']").length > 0
       || /no (guns|results|listings) found|0 guns found/i.test(
         (document.body?.innerText || "").slice(0, 3000)),
-    { timeout: 8000, polling: 200 }
+    { timeout: 4000, polling: 150 }
   ).catch(() => {});
 
   // Extract listings from the page

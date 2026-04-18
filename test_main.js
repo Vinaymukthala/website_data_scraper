@@ -14,7 +14,7 @@ const inputRaw = {
     "location": {
       "locationId": "001"
     },
-    "firearm": { firearmType: "HANDGUN", brand: "GLOCK", model: "19", caliber: "9MM" }
+    "firearm": { firearmType: "HANDGUN", brand: "Colt", model: "Anaconda", caliber: ".45" }
   }
 };
 
