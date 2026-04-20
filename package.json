@@ -5,10 +5,12 @@
   "type": "module",
   "main": "./test_main.js",
   "scripts": {
-    "start": "node test_main.js"
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
+    "express": "^5.2.1",
     "puppeteer": "^24.0.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-anonymize-ua": "^2.4.6",
