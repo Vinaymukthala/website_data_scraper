@@ -63,7 +63,7 @@ async function fetchViaScraperAPI(targetUrl, apiKey) {
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY;
+  const apiKey = process.env.SCRAPER_API_KEY || "e21aad3e18c55591c5186bac018bcfe2";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];

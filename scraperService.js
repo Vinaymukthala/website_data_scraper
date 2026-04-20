@@ -5,7 +5,6 @@
  *   scrapeFirearm(input) → { query, sources, offerValue, errors, _meta }
  */
 
-import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
@@ -23,8 +22,10 @@ import * as collectorfirearms from "./scripts/providers/collectorfirearms.js";
 import * as budsgunshop from "./scripts/providers/budsgunshop.js";
 import * as gunbroker from "./scripts/providers/gunbroker.js";
 import * as palmettostatearmory from "./scripts/providers/palmettostatearmory.js";
+import * as grabagun from "./scripts/providers/grabagun.js";
+//import * as gunscom from "./scripts/providers/gunscom.js";
 
-const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd, collectorfirearms, budsgunshop, gunbroker, palmettostatearmory];
+const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd, collectorfirearms, budsgunshop, gunbroker, palmettostatearmory, grabagun];
 
 // ── Puppeteer setup ──────────────────────────────────────────────────────────
 
@@ -152,10 +153,10 @@ async function scrapeFirearm(input) {
         try {
           // ScraperAPI providers: cap at 8s (they typically respond in 2-4s)
           // Puppeteer providers: cap at timeoutMs (5s from SCRAPE_TIMEOUT_MS env)
-          const SCRAPERAPI_PROVIDERS = new Set(["budsgunshop", "gunbroker", "palmettostatearmory"]);
+          const SCRAPERAPI_PROVIDERS = new Set(["budsgunshop", "gunbroker", "palmettostatearmory", "grabagun", "gunscom"]);
           const providerTimeout = SCRAPERAPI_PROVIDERS.has(provider.sourceName)
-              ? 8000
-              : timeoutMs;
+            ? 25000
+            : timeoutMs;
 
           const rows = await withTimeout(
             provider.scrape({
