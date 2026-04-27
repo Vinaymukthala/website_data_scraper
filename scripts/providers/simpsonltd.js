@@ -14,81 +14,21 @@
  */
 
 import { setTimeout as delay } from "node:timers/promises";
-import { conditionFromText, ensureNotBlocked, parseUsdPrice, toAbsoluteUrl } from "./_util.js";
+import { 
+  conditionFromText, 
+  ensureNotBlocked, 
+  parseUsdPrice, 
+  toAbsoluteUrl,
+  isAccessory,
+  extractKeywords,
+  isRelevant
+} from "./_util.js";
 
 export const sourceName = "simpsonltd";
 
 const BASE_URL = "https://www.simpsonltd.com/";
 const MAX_LISTINGS = Number(process.env.SL_MAX_LISTINGS) || 10;
 const DETAIL_DELAY_MS = Number(process.env.SL_DETAIL_DELAY) || 200;
-
-// ---------------------------------------------------------------------------
-// Relevance filtering — same approach as GI
-// ---------------------------------------------------------------------------
-const CALIBRE_NOISE = new Set([
-  "MM", "LUGER", "ACP", "AUTO", "MAG", "MAGNUM", "SPECIAL", "WIN",
-  "WINCHESTER", "REM", "REMINGTON", "NATO", "GAP", "SUPER", "SHORT",
-  "LONG", "RIFLE", "PISTOL", "SHOTGUN", "GAUGE", "GA", "FOR", "SALE",
-  "12GA", "20GA", "28GA", "410",
-]);
-
-function extractKeywords(query) {
-  return query
-    .toUpperCase()
-    .split(/\s+/)
-    .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !CALIBRE_NOISE.has(w));
-}
-
-function isRelevant(title, keywords, minMatch) {
-  if (!title || keywords.length === 0) return true;
-  const upper = title.toUpperCase();
-  let matched = 0;
-  for (const kw of keywords) {
-    if (upper.includes(kw)) matched++;
-  }
-  return matched >= minMatch;
-}
-
-// ---------------------------------------------------------------------------
-// Accessory keywords — filter out non-guns
-// ---------------------------------------------------------------------------
-const ACCESSORY_KEYWORDS = [
-  "MAGAZINE", "MAGAZINES", "MAG ", "MAGS ",
-  "HOLSTER", "HOLSTERS",
-  "GRIP", "GRIPS",
-  "BARREL ONLY", "BARREL ASSEMBLY",
-  "STOCK ONLY", "STOCK SET",
-  "SCOPE", "OPTIC", "OPTICS",
-  "SLING", "CASE ", "HARD CASE", "SOFT CASE",
-  "CLEANING KIT", "TOOL", "WRENCH",
-  "FOREND ONLY", "BUTTSTOCK",
-  "MANUAL", "BOOK ", "BOOKS",
-  "PARTS KIT", "PARTS LOT", "SPARE PARTS",
-  "CONVERSION KIT",
-  "LOADER", "SPEEDLOADER",
-  "LIGHT", "LASER", "FLASHLIGHT",
-  "SUPPRESSOR", "SILENCER",
-  "BAYONET", "KNIFE",
-  "AMMO", "AMMUNITION", "CARTRIDGE",
-  "RELOADING",
-];
-
-function isAccessory(title) {
-  const upper = (title || "").toUpperCase();
-  if (ACCESSORY_KEYWORDS.some(kw => upper.includes(kw))) return true;
-
-  // Custom standalone match for "BARREL" and parts without accidentally filtering out 
-  // valid guns with descriptions like "4 INCH BARREL"
-  if (/\b(BARREL|BARRELS|RECEIVER|SLIDE|UPPER|LOWER|CHOKE|CHOKES|PARTS)\b/.test(upper)) {
-    // If it contains barrel but also says "INCH BARREL", "IN BARREL", or "EXTRA BARREL", it is mostly likely a gun
-    if (/\b(INCH\s+BARREL|IN\s+BARREL|" BARREL|'' BARREL|EXTRA\s+BARREL)\b/.test(upper)) {
-      return false;
-    }
-    return true; 
-  }
-
-  return false;
-}
 
 // ---------------------------------------------------------------------------
 // Clean up raw title from listing cards
@@ -261,7 +201,9 @@ async function scrapeDetailPage(page, href) {
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
-export async function scrape({ page, query }) {
+export async function scrape({ page, query, model, firearmType }) {
+  const keywords = extractKeywords(query);
+
   await navigateSearch(page, query);
 
   let listings = await collectListingUrls(page);
@@ -284,35 +226,23 @@ export async function scrape({ page, query }) {
   }
 
   // ── Filter out accessories ─────────────────────────────────────────
-  const beforeFilter = listings.length;
-  listings = listings.filter(l => {
-    const title = cleanTitle(l.rawTitle);
-    if (isAccessory(title)) {
-      console.log(`[${sourceName}] Skipping accessory: "${title}"`);
-      return false;
+  const relevant = listings.filter(l => {
+    const title = (l.rawTitle || "").toUpperCase();
+    const upBrand = (query.split(" ")[0] || "").toUpperCase();
+    const upModel = (model || "").toUpperCase();
+    
+    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
+    const hasCaliber = calibers.some(c => title.includes(c));
+    const hasBrand = title.includes(upBrand);
+    const hasModel = upModel ? title.includes(upModel) : true;
+
+    if (hasBrand && hasModel && hasCaliber) {
+       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
+       return true;
     }
-    return true;
+
+    return !isAccessory(l.rawTitle) && isRelevant(l.rawTitle, keywords, sourceName, model);
   });
-  console.log(`[${sourceName}] Filtered: ${beforeFilter} → ${listings.length} (removed ${beforeFilter - listings.length} accessories)`);
-
-  // ── Relevance filtering — match user query keywords ────────────────
-  const keywords = extractKeywords(query);
-  const minMatch = Math.min(2, keywords.length);
-
-  let relevant = listings.filter(l => isRelevant(cleanTitle(l.rawTitle), keywords, minMatch));
-  console.log(`[${sourceName}] Relevance: ${listings.length} → ${relevant.length} strict match (keywords: [${keywords.join(", ")}])`);
-
-  // Fallback: relax to 1 keyword (brand only)
-  if (relevant.length === 0 && keywords.length > 1) {
-    relevant = listings.filter(l => isRelevant(cleanTitle(l.rawTitle), keywords, 1));
-    console.log(`[${sourceName}] Relaxed to 1-keyword match: ${relevant.length} result(s)`);
-  }
-
-  // Final fallback: all non-accessory listings
-  if (relevant.length === 0) {
-    relevant = listings;
-    console.log(`[${sourceName}] Using all ${relevant.length} non-accessory listings as fallback.`);
-  }
 
   listings = relevant.slice(0, MAX_LISTINGS);
 
@@ -333,7 +263,9 @@ export async function scrape({ page, query }) {
         sourceName,
         condition: p.specs.stock || conditionFromText(title) || "Unknown",
         pageUrl,
-        gunName: title || null,
+        title: title || null,
+        description: "",
+        model: model || "",
         specs: p.specs || {},
         price: { currency: "USD", original: price },
       };
@@ -374,7 +306,9 @@ export async function scrape({ page, query }) {
         sourceName,
         condition: data.condition || conditionFromText(data.title) || "Unknown",
         pageUrl,
-        gunName: data.title || cleanTitle(listing.rawTitle) || null,
+        title: data.title || cleanTitle(listing.rawTitle) || null,
+        description: "",
+        model: model || "",
         sku: data.sku || null,
         specs: data.specs || {},
         price: { currency: "USD", original: price },

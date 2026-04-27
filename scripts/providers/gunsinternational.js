@@ -10,52 +10,22 @@
  */
 
 import { setTimeout as delay } from "node:timers/promises";
-import { parseUsdPrice } from "./_util.js";
+import { 
+  parseUsdPrice, 
+  isAccessory, 
+  extractKeywords, 
+  isRelevant 
+} from "./_util.js";
 
 export const sourceName = "gunsinternational";
 
 const BASE_URL = "https://www.gunsinternational.com/";
 const MAX_LISTINGS = Number(process.env.GI_MAX_LISTINGS) || 10;
-
 const SEARCH_CATEGORY = { HANDGUN: "Pistols", RIFLE: "Rifles", SHOTGUN: "Shotguns" };
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-const ACCESSORY_RE = /MAGAZINE|HOLSTER|GRIP[S ]|SCOPE|OPTIC|SLING|CLEANING|AMMO|BAYONET|CASE |PARTS KIT|MANUAL|BOOK |CONVERSION KIT|LOADER|LASER|FLASHLIGHT|SUPPRESSOR|SILENCER|KNIFE/i;
-
-function isAccessory(title) {
-  const upper = (title || "").toUpperCase();
-  if (ACCESSORY_RE.test(upper)) return true;
-
-  // Custom standalone match for "BARREL" and parts without blocking valid guns like "4 INCH BARREL"
-  if (/\b(BARREL|BARRELS|RECEIVER|SLIDE|UPPER|LOWER|CHOKE|CHOKES|PARTS)\b/.test(upper)) {
-    if (/\b(INCH\s+BARREL|IN\s+BARREL|" BARREL|'' BARREL|EXTRA\s+BARREL)\b/.test(upper)) {
-      return false;
-    }
-    return true; 
-  }
-  return false;
-}
-
-const CALIBRE_NOISE = new Set([
-  "MM", "LUGER", "ACP", "AUTO", "MAG", "MAGNUM", "SPECIAL", "WIN",
-  "WINCHESTER", "REM", "REMINGTON", "NATO", "GAP", "SUPER", "SHORT",
-  "LONG", "RIFLE", "PISTOL", "SHOTGUN", "GAUGE", "GA", "FOR", "SALE",
-]);
-
-function extractKeywords(query) {
-  return query.toUpperCase().split(/\s+/)
-    .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !CALIBRE_NOISE.has(w));
-}
-
-function matchCount(title, keywords) {
-  const up = (title || "").toUpperCase();
-  return keywords.reduce((n, kw) => n + (up.includes(kw) ? 1 : 0), 0);
-}
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
-export async function scrape({ page, query, firearmType }) {
+export async function scrape({ page, query, model, firearmType }) {
   const type = String(firearmType || "").trim().toUpperCase();
   const cat = SEARCH_CATEGORY[type] || "";
   const keywords = extractKeywords(query);
@@ -147,7 +117,10 @@ export async function scrape({ page, query, firearmType }) {
       const cm = ct.match(/\b(New|Used|Excellent|Very Good|Good|Fair|Poor|Like New|NIB)\b/i);
       if (cm) cond = cm[1];
 
-      out.push({ url: href, title: title.slice(0, 200), price, condition: cond });
+      const descEl = box.querySelector(".description, .desc, p");
+      const description = descEl ? (descEl.textContent || "").trim().slice(0, 300) : "";
+
+      out.push({ url: href, title: title.slice(0, 200), price, condition: cond, description });
     }
 
     // Strategy 2: gun_id= links (fallback)
@@ -177,7 +150,7 @@ export async function scrape({ page, query, firearmType }) {
         let cond = "Unknown";
         if (el) { const cm = (el.textContent || "").match(/\b(New|Used|Excellent|Very Good|Good|Fair|Poor|Like New|NIB)\b/i); if (cm) cond = cm[1]; }
 
-        out.push({ url: href, title: title.slice(0, 200), price, condition: cond });
+        out.push({ url: href, title: title.slice(0, 200), price, condition: cond, description: "" });
       }
     }
     return out;
@@ -189,15 +162,25 @@ export async function scrape({ page, query, firearmType }) {
   // Filter: accessories, relevance, nav links
   const NAV_RE = /new-guns-for-sale-today|recently-sold|gun-of-the-month|featured-guns|gun-shows|gun-dealers|\.catt\.cfm|search\.cfm$|search-results\.cfm$/i;
 
-  let listings = raw
+  const relevant = raw
     .filter(l => !NAV_RE.test(l.url))
-    .filter(l => !isAccessory(l.title));
+    .filter(l => {
+      const title = (l.title || "").toUpperCase();
+      const upBrand = (query.split(" ")[0] || "").toUpperCase();
+      const upModel = (model || "").toUpperCase();
+      
+      const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
+      const hasCaliber = calibers.some(c => title.includes(c));
+      const hasBrand = title.includes(upBrand);
+      const hasModel = upModel ? title.includes(upModel) : true;
 
-  // Relevance filter (progressive)
-  let relevant = listings.filter(l => matchCount(l.title, keywords) >= minMatch);
-  if (relevant.length === 0 && keywords.length > 1)
-    relevant = listings.filter(l => matchCount(l.title, keywords) >= 1);
-  if (relevant.length === 0) relevant = listings;
+      if (hasBrand && hasModel && hasCaliber) {
+         if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
+         return true;
+      }
+
+      return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
+    });
 
   // Build results — only keep listings that already have a price
   const results = [];
@@ -208,7 +191,9 @@ export async function scrape({ page, query, firearmType }) {
       sourceName,
       condition: l.condition || "Unknown",
       pageUrl: l.url,
-      gunName: l.title || null,
+      title: l.title || null,
+      description: l.description || "",
+      model: model || "",
       price: { currency: "USD", original: p },
     });
   }

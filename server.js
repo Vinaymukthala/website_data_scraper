@@ -43,7 +43,7 @@ app.listen(PORT, () => {
   console.log(`\n=========================================`);
   console.log(`🚀 Scraper API is running on port ${PORT}`);
   console.log(`=========================================`);
-  console.log(`Hit the endpoint using POST http://localhost:${PORT}/api/scrape`);
+  console.log(`Hit the endpoint using POST http://localhost:${PORT}/bp-fallback/scrape`);
   console.log(`Example JSON Body:`);
   console.log(`{`);
   console.log(`  "firearmType": "HANDGUN",`);

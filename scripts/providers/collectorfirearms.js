@@ -9,54 +9,26 @@
  *   CF_MAX_LISTINGS=10   Max products to return (default 10)
  */
 
-import { parseUsdPrice, conditionFromText } from "./_util.js";
+import { 
+  parseUsdPrice, 
+  conditionFromText, 
+  isAccessory, 
+  extractKeywords, 
+  isRelevant,
+  extractBrandAndCaliber
+} from "./_util.js";
 
 export const sourceName = "collectorfirearms";
 
 const BASE_URL = "https://collectorsfirearms.com/";
 const MAX_LISTINGS = Number(process.env.CF_MAX_LISTINGS) || 10;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-const ACCESSORY_RE = /MAGAZINE|HOLSTER|GRIP[S ]|SCOPE|OPTIC|SLING|CLEANING|AMMO|BAYONET|CASE |PARTS KIT|MANUAL|BOOK |CONVERSION KIT|LOADER|LASER|FLASHLIGHT|SUPPRESSOR|SILENCER|KNIFE/i;
-
-function isAccessory(title) {
-  const upper = (title || "").toUpperCase();
-  if (ACCESSORY_RE.test(upper)) return true;
-
-  // Block standalone barrels, slides, parts — but allow guns that mention barrel length
-  if (/\b(BARREL|BARRELS|RECEIVER|SLIDE|UPPER|LOWER|CHOKE|CHOKES|PARTS)\b/.test(upper)) {
-    if (/\b(INCH\s+BARREL|IN\s+BARREL|" BARREL|'' BARREL|EXTRA\s+BARREL)\b/.test(upper)) {
-      return false;
-    }
-    return true;
-  }
-  return false;
-}
-
-const CALIBRE_NOISE = new Set([
-  "MM", "LUGER", "ACP", "AUTO", "MAG", "MAGNUM", "SPECIAL", "WIN",
-  "WINCHESTER", "REM", "REMINGTON", "NATO", "GAP", "SUPER", "SHORT",
-  "LONG", "RIFLE", "PISTOL", "SHOTGUN", "GAUGE", "GA", "FOR", "SALE",
-  "SN", "NEW", "USED",
-]);
-
-function extractKeywords(query) {
-  return query.toUpperCase().split(/\s+/)
-    .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !CALIBRE_NOISE.has(w));
-}
-
-function matchCount(title, keywords) {
-  const up = (title || "").toUpperCase();
-  return keywords.reduce((n, kw) => n + (up.includes(kw) ? 1 : 0), 0);
-}
-
 /**
  * Clean up the raw title from the search card.
  * Removes leading SKU codes like "(SN: CHED655)" and trailing item IDs like "(L2026-04730)"
  */
 function cleanTitle(rawTitle) {
-  let t = String(rawTitle || "").trim();
+  let t = String(rawTitle || "").replace(/\s+/g, " ").trim();
   // Remove serial number prefix: "(SN: CHED655)"
   t = t.replace(/^\(SN:\s*[^)]+\)\s*/i, "");
   // Remove item ID suffix: "(L2026-04730)"
@@ -64,7 +36,7 @@ function cleanTitle(rawTitle) {
   // Trim trailing "NEW" / "USED" condition tag (we extract it separately)
   // Handles both "PISTOL 9MM NEW" and "PISTOL 9MMNEW" (no space)
   t = t.replace(/(NEW|USED)\s*$/i, "");
-  return t.replace(/\s{2,}/g, " ").trim();
+  return t.trim();
 }
 
 /**
@@ -84,7 +56,7 @@ function extractCondition(title, description) {
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
-export async function scrape({ page, query, firearmType }) {
+export async function scrape({ page, query, model, firearmType }) {
   const keywords = extractKeywords(query);
   const minMatch = Math.min(2, keywords.length);
 
@@ -193,14 +165,23 @@ export async function scrape({ page, query, firearmType }) {
   console.log(`[${sourceName}] Extracted ${raw.length} listing(s).`);
   if (raw.length === 0) return [];
 
-  // Filter: accessories
-  let listings = raw.filter(l => !isAccessory(l.title));
+  let relevant = raw.filter(l => {
+    const title = (l.title || "").toUpperCase();
+    const upBrand = (query.split(" ")[0] || "").toUpperCase();
+    const upModel = (model || "").toUpperCase();
+    
+    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
+    const hasCaliber = calibers.some(c => title.includes(c));
+    const hasBrand = title.includes(upBrand);
+    const hasModel = upModel ? title.includes(upModel) : true;
 
-  // Relevance filter (progressive)
-  let relevant = listings.filter(l => matchCount(l.title, keywords) >= minMatch);
-  if (relevant.length === 0 && keywords.length > 1)
-    relevant = listings.filter(l => matchCount(l.title, keywords) >= 1);
-  if (relevant.length === 0) relevant = listings;
+    if (hasBrand && hasModel && hasCaliber) {
+       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
+       return true;
+    }
+
+    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
+  });
 
   // Build results
   const results = [];
@@ -211,11 +192,17 @@ export async function scrape({ page, query, firearmType }) {
     const title = cleanTitle(l.title);
     const condition = extractCondition(l.title, l.description);
 
+    const { brand, caliber } = extractBrandAndCaliber(l.title, keywords);
+
     results.push({
       sourceName,
       condition,
       pageUrl: l.url,
-      gunName: title || null,
+      title: title || null,
+      description: l.description || "",
+      model: model || "",
+      brand,
+      caliber,
       price: { currency: "USD", original: p },
     });
   }

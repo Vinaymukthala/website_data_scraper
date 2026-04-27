@@ -13,6 +13,13 @@ import puppeteerExtra from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import AnonymizeUAPlugin from "puppeteer-extra-plugin-anonymize-ua";
 
+import {
+  isAccessory,
+  extractKeywords,
+  isRelevant,
+  parseUsdPrice
+} from "./scripts/providers/_util.js";
+
 // ── Provider registry ────────────────────────────────────────────────────────
 
 import * as truegunvalue from "./scripts/providers/truegunvalue.js";
@@ -26,6 +33,18 @@ import * as grabagun from "./scripts/providers/grabagun.js";
 //import * as gunscom from "./scripts/providers/gunscom.js";
 
 const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd, collectorfirearms, budsgunshop, gunbroker, palmettostatearmory, grabagun];
+
+const PROVIDER_DEFAULT_CONDITIONS = {
+  "gunbroker": "Used",
+  "gunsinternational": "Used",
+  "truegunvalue": "Used",
+  "grabagun": "New",
+  "budsgunshop": "New",
+  "palmettostatearmory": "New",
+  "gunscom": "Used",
+  "simpsonltd": "Used",
+  "collectorfirearms": "Used",
+};
 
 // ── Puppeteer setup ──────────────────────────────────────────────────────────
 
@@ -60,7 +79,7 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-function normalizeRow(row, brand, caliber) {
+function normalizeRow(row, brand, caliber, model) {
   const price = row?.price?.original;
   if (typeof price !== "number" || !Number.isFinite(price)) {
     return null;
@@ -71,14 +90,36 @@ function normalizeRow(row, brand, caliber) {
     return null;
   }
 
+  const rawTitle = row.title || row.gunName;
+  const title = rawTitle ? String(rawTitle).replace(/\s+/g, " ").trim() : null;
+  if (!title || title.length < 3) {
+    return null; // Mandatory title
+  }
+
+  const description = row.description ? String(row.description).trim() : "";
+
+  let condition = String(row.condition || "Unknown");
+  const sourceName = String(row.sourceName || "unknown");
+
+  // Inject default condition if unknown
+  if (condition === "Unknown" && PROVIDER_DEFAULT_CONDITIONS[sourceName]) {
+    condition = PROVIDER_DEFAULT_CONDITIONS[sourceName];
+  }
+
+  const finalBrand = row.brand ? String(row.brand).trim() : brand;
+  const finalCaliber = row.caliber ? String(row.caliber).trim() : caliber;
+  const finalModel = row.model ? String(row.model).trim() : model;
+
   return {
     sourceId: "000",
-    sourceName: String(row.sourceName || "unknown"),
-    condition: String(row.condition || "Unknown"),
+    sourceName,
+    condition,
     pageUrl,
-    gunName: row.gunName ? String(row.gunName) : null,
-    brand,
-    caliber,
+    title,
+    description,
+    brand: finalBrand,
+    model: finalModel,
+    caliber: finalCaliber,
     price: {
       currency: "USD",
       original: price,
@@ -162,6 +203,7 @@ async function scrapeFirearm(input) {
             provider.scrape({
               page,
               query: QUERY,
+              model: MODEL,
               firearmType: TYPE,
             }),
             providerTimeout,
@@ -216,8 +258,74 @@ async function scrapeFirearm(input) {
     await browser.close().catch(() => { });
   }
 
+  const keywords = extractKeywords(QUERY);
+
   const sources = allRows
-    .map((row) => normalizeRow(row, BRAND, CALIBER))
+    .filter(row => {
+      const title = row.title || row.gunName || "";
+      const upTitle = title.toUpperCase();
+
+      // UNIVERSAL EXPLICIT PART FILTER: Reject immediately if it matches explicit accessory patterns
+      let isExplicitPart = false;
+      const EXPLICIT_PART_REGEXES = [
+        /\b(FOR|FITS)\b.*\b(MOSSBERG|GLOCK|TAURUS|SIG|RUGER|SMITH|MAVERICK|MODEL|GEN|G\d+|P\d+)\b/i,
+        /\b(MINICLIP|CHOKE|HEAT SHIELD|MOUNT|RAIL)\b/i,
+        /\b(GRIP|STOCK|HANDGUARD|FOREND)\s+KIT\b/i,
+        /^\s*(PRO\s*MAG|MAGPUL|ETS|MEC-GAR|OPSOL)\b/i,
+        /\bBARREL\b$/i
+      ];
+
+      for (const re of EXPLICIT_PART_REGEXES) {
+        if (re.test(upTitle)) {
+          isExplicitPart = true;
+          break;
+        }
+      }
+
+      if (!isExplicitPart) {
+        const hasMagWord = /\b(MAGAZINE[S]?|MAG[S]?)\b/i.test(upTitle);
+        const hasGunWord = /\b(PISTOL|RIFLE|SHOTGUN|REVOLVER|HANDGUN|BARREL|FRAME|SLIDE|RECEIVER)\b/i.test(upTitle);
+        if (hasMagWord && !hasGunWord) {
+          isExplicitPart = true;
+        }
+      }
+
+      if (isExplicitPart) {
+          return false;
+      }
+
+      const upBrand = BRAND.toUpperCase();
+      const upModel = MODEL.toUpperCase();
+      
+      const calibers = [CALIBER.toUpperCase(), CALIBER.toUpperCase().replace(" GA", "GA")];
+      const hasCaliber = calibers.some(c => upTitle.includes(c));
+      const hasBrand = upTitle.includes(upBrand);
+      const hasModel = upModel.split(" ").every(word => upTitle.includes(word));
+
+      // If it contains Brand, Model, and a Caliber, it's highly likely a gun (bypass aggressive accessory filter)
+      let isStrictMatch = false;
+      if (hasBrand && hasModel && hasCaliber && !/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(upTitle)) {
+        isStrictMatch = true;
+      }
+
+      // Centralized safety net: filter out accessories and irrelevant items
+      if (!isStrictMatch && isAccessory(title, BRAND)) {
+        return false;
+      }
+      if (!isStrictMatch && !isRelevant(title, keywords, row.sourceName, MODEL)) {
+        return false;
+      }
+
+      // Special rule for PSA: Brand and Model MUST be in the title
+      if (row.sourceName === "palmettostatearmory") {
+        if (!upTitle.includes(upBrand) || !upTitle.includes(upModel)) {
+          return false;
+        }
+      }
+
+      return true;
+    })
+    .map((row) => normalizeRow(row, BRAND, CALIBER, MODEL))
     .filter(Boolean)
     .sort((a, b) => a.price.original - b.price.original);
 

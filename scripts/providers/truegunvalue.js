@@ -1,4 +1,4 @@
-import { ensureNotBlocked, parseUsdPrice } from "./_util.js";
+import { ensureNotBlocked, parseUsdPrice, extractBrandAndCaliber } from "./_util.js";
 
 export const sourceName = "truegunvalue";
 
@@ -122,12 +122,20 @@ export async function scrape({ page, query, firearmType }) {
   const allListings = listingsFromScrapedText(text, searchModel);
   console.log(`[${sourceName}] Parsed ${allListings.length} matching listing(s) (model filter: "${searchModel}").`);
 
-  return allListings.map((l) => ({
-    sourceName,
-    condition: l.condition || "Unknown",
-    conditionType: conditionTypeFromCondition(l.condition),
-    pageUrl: pdpUrl,
-    gunName: l.title || null,
-    price: { currency: "USD", original: l.price },
-  }));
+  return allListings.map((l) => {
+    const { brand, caliber } = extractBrandAndCaliber(l.title);
+
+    return {
+      sourceName,
+      condition: l.condition || "Unknown",
+      conditionType: conditionTypeFromCondition(l.condition),
+      pageUrl: pdpUrl,
+      title: l.title || null,
+      description: "",
+      model: l.model || "",
+      brand,
+      caliber,
+      price: { currency: "USD", original: l.price },
+    };
+  });
 }

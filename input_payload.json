@@ -1,0 +1,10 @@
+{
+  "quickQuoteRequest": {
+    "firearm": {
+      "firearmType": "HANDGUN",
+      "brand": "Sig Sauer",
+      "model": "P320",
+      "caliber": "9mm"
+    }
+  }
+}

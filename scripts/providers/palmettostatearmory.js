@@ -10,43 +10,17 @@
  */
 
 import * as cheerio from "cheerio";
-import { parseUsdPrice } from "./_util.js";
+import {
+  parseUsdPrice,
+  isAccessory,
+  extractKeywords,
+  isRelevant,
+  extractBrandAndCaliber
+} from "./_util.js";
 
 export const sourceName = "palmettostatearmory";
 
 const MAX_LISTINGS = Number(process.env.PSA_MAX_LISTINGS) || 10;
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-const ACCESSORY_RE = /\bMAGAZINE[S]?\b|\bHOLSTER\b|\bGRIP[S]?\b|\bSCOPE\b|\bOPTIC[S]?\b|\bSLING\b|\bCLEANING\b|\bAMMO\b|\bBAYONET\b|\bPARTS KIT\b|\bMANUAL\b|\bCONVERSION KIT\b|\bLOADER\b|\bLASER\b|\bFLASHLIGHT\b|\bSUPPRESSOR\b|\bSILENCER\b|\bKNIFE\b|\bBARREL\b|\bCOMPENSATOR\b|\bCOMP\b|\bMUZZLE\b|\bBRAKE\b|\bSLIDE\b|\bFRAME\b|\bRECEIVER\b|\bTRIGGER\b|\bSIGHT[S]?\b/i;
-const ACCESSORY_BRAND_RE = /\b(MAGPUL|PMAG|KCI|ETS|RWB|HEXMAG|TAPCO|MCARBO|STRIKE\s+INDUSTRIES|BACKUP\s+TACTICAL|RIVAL\s+ARMS|FORTIS|TRUE\s+PRECISION|RADIAN\s+WEAPONS|ZAFFIRI|LONE\s+WOLF)\b/i;
-
-function isAccessory(title) {
-  const upper = (title || "").toUpperCase();
-  if (ACCESSORY_RE.test(upper)) return true;
-  if (ACCESSORY_BRAND_RE.test(upper)) return true;
-  // MAG + round count = magazine
-  if (/\bMAG\b/.test(upper) && !/\bMAGNUM\b/.test(upper) && /\b\d+\s*ROUND\b|\b\d+RD\b/.test(upper)) return true;
-  // "X Round Magazine"
-  if (/\b\d+\s*ROUND\s+MAGAZINE\b/.test(upper)) return true;
-  return false;
-}
-
-const CALIBRE_NOISE = new Set([
-  "MM", "LUGER", "ACP", "AUTO", "MAG", "MAGNUM", "SPECIAL", "WIN",
-  "WINCHESTER", "REM", "REMINGTON", "NATO", "GAP", "SUPER", "SHORT",
-  "LONG", "RIFLE", "PISTOL", "SHOTGUN", "GAUGE", "GA", "FOR", "SALE",
-]);
-
-function extractKeywords(query) {
-  return query.toUpperCase().split(/\s+/)
-    .filter(w => w.length >= 2 && !/^\d+$/.test(w) && !CALIBRE_NOISE.has(w));
-}
-
-function matchCount(title, keywords) {
-  const up = (title || "").toUpperCase();
-  return keywords.reduce((n, kw) => n + (up.includes(kw) ? 1 : 0), 0);
-}
 
 /**
  * Fetch via ScraperAPI — plain mode, no render needed for Magento stores.
@@ -62,8 +36,8 @@ async function fetchViaScraperAPI(targetUrl, apiKey) {
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
-export async function scrape({ page, query, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "e21aad3e18c55591c5186bac018bcfe2";
+export async function scrape({ page, query, model, firearmType }) {
+  const apiKey = process.env.SCRAPER_API_KEY || "a96f83295b5cb373ae7d5f5446cc96aa";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
@@ -130,21 +104,25 @@ export async function scrape({ page, query, firearmType }) {
   if (raw.length === 0) return [];
 
   // Filter accessories
-  let listings = raw.filter(l => {
-    if (isAccessory(l.title)) {
-      console.log(`[${sourceName}] Skipping accessory: "${l.title}"`);
-      return false;
+  let relevant = raw.filter(l => {
+    const title = (l.title || "").toUpperCase();
+    const upBrand = (query.split(" ")[0] || "").toUpperCase();
+    const upModel = (model || "").toUpperCase();
+    
+    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
+    const hasCaliber = calibers.some(c => title.includes(c));
+    const hasBrand = title.includes(upBrand);
+    const hasModel = upModel ? title.includes(upModel) : true;
+
+    if (hasBrand && hasModel && hasCaliber) {
+       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
+       return true;
     }
-    return true;
+
+    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
   });
 
-  // Relevance filter (progressive)
-  let relevant = listings.filter(l => matchCount(l.title, keywords) >= minMatch);
-  if (relevant.length === 0 && keywords.length > 1)
-    relevant = listings.filter(l => matchCount(l.title, keywords) >= 1);
-  if (relevant.length === 0) relevant = listings;
-
-  console.log(`[${sourceName}] After filters: ${relevant.length} relevant listing(s).`);
+  console.log(`[${sourceName}] After site-specific filters: ${relevant.length} relevant listing(s).`);
 
   // Build results
   const results = [];
@@ -156,11 +134,17 @@ export async function scrape({ page, query, firearmType }) {
     let condition = "New"; // PSA sells new firearms
     if (/\bUSED\b/.test(upper)) condition = "Used";
 
+    const { brand, caliber } = extractBrandAndCaliber(l.title, keywords);
+
     results.push({
       sourceName,
       condition,
       pageUrl: l.url,
-      gunName: l.title.slice(0, 200) || null,
+      title: l.title.slice(0, 200) || null,
+      description: l.description || "",
+      model: model || "",
+      brand,
+      caliber,
       price: { currency: "USD", original: p },
     });
   }
