@@ -175,7 +175,7 @@ async function fetchPdpData(pdpUrl, apiKey) {
           if (key === "stockGrips") key = "stock";
           if (key === "rateOfTwist") key = "twist";
           if (key === "ofMagazines") key = "magazineCount";
-          
+
           if (!specs[key]) specs[key] = m[1].trim();
         }
       }
@@ -197,7 +197,7 @@ async function fetchPdpData(pdpUrl, apiKey) {
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, model, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "65caf441e3d532533fc4af93002263b9";
+  const apiKey = process.env.SCRAPER_API_KEY || "7260a6ebef2b9568767d0c2cb1c03515";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
@@ -206,7 +206,7 @@ export async function scrape({ page, query, model, firearmType }) {
   const keywords = extractKeywords(query);
 
   // Sort=13 = Buy Now items,
-  const searchUrl = `https://www.gunbroker.com/all/search?keywords=${encodeURIComponent(query)}&Sort=13`;
+  const searchUrl = `https://www.gunbroker.com/guns-firearms/search?keywords=${encodeURIComponent(query)}&Sort=13`;
   console.log(`[${sourceName}] ${searchUrl} (via ScraperAPI)`);
 
   let html;

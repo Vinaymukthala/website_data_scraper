@@ -32,9 +32,12 @@ export async function scrape({ page, query, model, firearmType }) {
   const keywords = extractKeywords(query);
   const minMatch = Math.min(2, keywords.length);
 
-  // Build search URL
-  const url = new URL("/search-results.cfm", BASE_URL);
-  url.searchParams.set("Quick_Search_Keyword", query);
+  // Build search URL — use advanced search with exclude terms to get guns only
+  const url = new URL("/adv-results.cfm", BASE_URL);
+  url.searchParams.set("keyword", query);
+  url.searchParams.set("exclude_term", "accessories, gun parts, NFA, Services, Articles");
+  url.searchParams.set("the_order", "6");
+  url.searchParams.set("start_row", "1");
   if (cat) url.searchParams.set("qs_cat", cat);
 
   console.log(`[${sourceName}] ${url.href}`);
@@ -191,30 +194,29 @@ export async function scrape({ page, query, model, firearmType }) {
   const PDP_LIMIT = 3;
   const pdpTargets = relevant.slice(0, PDP_LIMIT);
 
-  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) sequentially for descriptions...`);
+  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
 
-  for (const listing of pdpTargets) {
+  const browser = page.browser();
+
+  await Promise.all(pdpTargets.map(async (listing) => {
     const pdpUrl = listing.url;
+    let pdpPage;
     try {
-      await delay(200);
+      pdpPage = await browser.newPage();
       try {
-        await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await pdpPage.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
       } catch {
         // partial load
       }
 
-      await page.waitForFunction(
+      await pdpPage.waitForFunction(
         () => (document.body.innerText || "").length > 100,
         { timeout: 3000 }
       ).catch(() => {});
 
-      const data = await page.evaluate(() => {
-        // GI page structure: a single div.row contains title, "Description:" text,
-        // then spec lines (Rifle Caliber:, Manufacturer:, etc.), then Price.
-        // There is NO #description element.
+      const data = await pdpPage.evaluate(() => {
         const specs = {};
 
-        // Find the content area — the innermost div containing spec labels
         let contentText = "";
         document.querySelectorAll("div.row, div.col-xs-12").forEach(el => {
           const text = el.innerText || "";
@@ -224,20 +226,16 @@ export async function scrape({ page, query, model, firearmType }) {
             }
           }
         });
-        // Fallback: use body text
         if (!contentText) contentText = document.body.innerText || "";
 
-        // Extract description: text between "Description:" and the first spec label
         let description = "";
         const descMatch = contentText.match(/Description:\s*([\s\S]*?)(?=(?:Rifle Caliber|Pistol Caliber|Shotgun Gauge|Manufacturer|Model|Barrel Length|Condition|Action|Stock|Chambers|Bore)\s*:|Price:|$)/i);
         if (descMatch) {
           description = descMatch[1].trim();
         }
 
-        // Parse all label:value lines from the full content area
         const SKIP_LABELS = /^(price|buy\s*now|see\s*all|email|send|contact|seller|phone|state|zip|country|member|categories|ffl|shipping|payment|your|message|back|privacy|user|faq|career|gun[s]?\s*international|browse|advanced|new\s*today|go|check\s*payment|layaway|return|active\s*listing|company|first\s*name|last\s*name|fax|website|address|city)/i;
 
-        // GI-specific label aliases
         const LABEL_ALIASES = {
           "rifle caliber": "caliber",
           "pistol caliber": "caliber",
@@ -275,8 +273,10 @@ export async function scrape({ page, query, model, firearmType }) {
       pdpDataMap[pdpUrl] = data;
     } catch (e) {
       console.warn(`[${sourceName}] PDP failed for ${pdpUrl.substring(pdpUrl.lastIndexOf('/')+1, pdpUrl.lastIndexOf('/')+30)}: ${e.message || e}`);
+    } finally {
+      if (pdpPage) await pdpPage.close().catch(() => {});
     }
-  }
+  }));
 
   // Build results — only keep listings that already have a price
   const results = [];

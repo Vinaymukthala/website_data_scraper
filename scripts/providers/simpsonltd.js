@@ -231,17 +231,24 @@ export async function scrape({ page, query, model, firearmType }) {
   }
 
   // ── Filter out accessories ─────────────────────────────────────────
+  const searchedCaliber = (query.match(/\d+\s*(?:mm|ga|gauge|lr|acp|mag|rem|win|spl|s&w|bmg)/i) || [""])[0].toUpperCase();
+
   const relevant = listings.filter(l => {
     const title = (l.rawTitle || "").toUpperCase();
     const upBrand = (query.split(" ")[0] || "").toUpperCase();
     const upModel = (model || "").toUpperCase();
     
-    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
-    const hasCaliber = calibers.some(c => title.includes(c));
+    // Check caliber in BOTH title AND listing-page specs
+    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62", "12 GA", "20 GA", ".22 LR"];
+    const specCaliber = (l.specs?.caliber || "").toUpperCase();
+    const hasCaliber = calibers.some(c => title.includes(c) || specCaliber.includes(c));
+    // Also match if listing caliber contains the searched caliber
+    const caliberMatch = hasCaliber || (searchedCaliber && specCaliber.includes(searchedCaliber));
+    
     const hasBrand = title.includes(upBrand);
     const hasModel = upModel ? title.includes(upModel) : true;
 
-    if (hasBrand && hasModel && hasCaliber) {
+    if (hasBrand && hasModel && caliberMatch) {
        if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
        return true;
     }
@@ -257,37 +264,36 @@ export async function scrape({ page, query, model, firearmType }) {
     return [];
   }
 
-  console.log(`[${sourceName}] Visiting ${pdpTargets.length} detail pages sequentially...`);
+  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
   const results = [];
+  const browser = page.browser();
 
-  for (let i = 0; i < pdpTargets.length; i++) {
-    const listing = pdpTargets[i];
+  const pdpResults = await Promise.allSettled(pdpTargets.map(async (listing) => {
     const pageUrl = toAbsoluteUrl(BASE_URL, listing.href);
-    if (!pageUrl) continue;
+    if (!pageUrl) return null;
 
-      console.log(`[${sourceName}] [${i + 1}/${pdpTargets.length}] Scraping: ${pageUrl}`);
-
+    let pdpPage;
     try {
-      const data = await scrapeDetailPage(page, pageUrl);
+      pdpPage = await browser.newPage();
+      const data = await scrapeDetailPage(pdpPage, pageUrl);
 
       const finalTitle = data.title || cleanTitle(listing.rawTitle) || "";
       if (isAccessory(finalTitle)) {
         console.log(`[${sourceName}]   → Accessory: "${finalTitle}" — skipping.`);
-        continue;
+        return null;
       }
 
       const price = parseUsdPrice(data.priceText || listing.priceText);
       if (price == null || price <= 0) {
         console.log(`[${sourceName}]   → No valid price — skipping.`);
-        continue;
+        return null;
       }
 
       // Extract description from PDP page text
       let description = data.description || "";
       if (!description) {
-        // Try to extract from body text on PDP
         try {
-          description = await page.evaluate(() => {
+          description = await pdpPage.evaluate(() => {
             const mainArea = document.querySelector("main, #main, .product-detail, .product-page, article") || document.body;
             const ps = Array.from(mainArea.querySelectorAll("p"))
               .map(p => (p.innerText || p.textContent || "").trim())
@@ -298,7 +304,9 @@ export async function scrape({ page, query, model, firearmType }) {
         } catch { description = ""; }
       }
 
-      results.push({
+      console.log(`[${sourceName}]   → "${data.title}" — $${price}`);
+
+      return {
         sourceName,
         pageUrl,
         title: finalTitle || null,
@@ -308,16 +316,20 @@ export async function scrape({ page, query, model, firearmType }) {
         condition: normalizeCondition(data.condition),
         model: data.model || model || "",
         price: { currency: "USD", original: price },
-      });
-
-      console.log(`[${sourceName}]   → "${data.title}" — $${price}`);
+      };
     } catch (err) {
       console.warn(`[${sourceName}]   → Error: ${err?.message}`);
+      return null;
+    } finally {
+      if (pdpPage) await pdpPage.close().catch(() => {});
     }
+  }));
 
-    if (i < pdpTargets.length - 1) await delay(DETAIL_DELAY_MS);
+  for (const r of pdpResults) {
+    if (r.status === "fulfilled" && r.value) {
+      results.push(r.value);
+    }
   }
-
   console.log(`[${sourceName}] Done — ${results.length} result(s).`);
   return results;
 }

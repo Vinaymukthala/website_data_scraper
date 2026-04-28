@@ -183,31 +183,32 @@ export async function scrape({ page, query, model, firearmType }) {
     return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
   });
 
-  // ── Scrape detail pages sequentially for descriptions ────────────────
-  const pdpDataMap = {};
+  // ── Scrape detail pages in parallel for descriptions ────────────────
   const PDP_LIMIT = 3;
   const pdpTargets = relevant.slice(0, PDP_LIMIT);
 
-  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) sequentially for descriptions...`);
+  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
 
-  const delay = ms => new Promise(res => setTimeout(res, ms));
+  const browser = page.browser();
+  const pdpDataMap = {};
 
-  for (const listing of pdpTargets) {
+  await Promise.all(pdpTargets.map(async (listing) => {
     const pdpUrl = listing.url;
+    let pdpPage;
     try {
-      await delay(200);
+      pdpPage = await browser.newPage();
       try {
-        await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await pdpPage.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
       } catch {
         // partial load
       }
 
-      await page.waitForFunction(
+      await pdpPage.waitForFunction(
         () => (document.body.innerText || "").length > 100,
         { timeout: 3000 }
       ).catch(() => {});
 
-      const data = await page.evaluate(() => {
+      const data = await pdpPage.evaluate(() => {
         let description = "";
         const descEl = document.querySelector("#tab-description, .woocommerce-Tabs-panel--description, .product-description, .woocommerce-product-details__short-description");
         if (descEl) {
@@ -272,8 +273,10 @@ export async function scrape({ page, query, model, firearmType }) {
       pdpDataMap[pdpUrl] = data;
     } catch (e) {
       console.warn(`[${sourceName}] PDP failed for ${pdpUrl.substring(pdpUrl.lastIndexOf('/')+1, pdpUrl.lastIndexOf('/')+30)}: ${e.message || e}`);
+    } finally {
+      if (pdpPage) await pdpPage.close().catch(() => {});
     }
-  }
+  }));
 
   // Build results
   const results = [];

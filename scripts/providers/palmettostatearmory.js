@@ -97,7 +97,7 @@ async function fetchPdpData(pdpUrl, apiKey) {
       // Build one regex: (Label1|Label2|...): value
       const labelPattern = PSA_LABELS.map(l => l.replace(/[/]/g, "\\/").replace(/\s+/g, "\\s*")).join("|");
       const BOUNDARY = `(?=(?:${labelPattern}):|$)`;
-      
+
       for (const label of PSA_LABELS) {
         const escapedLabel = label.replace(/[/]/g, "\\/").replace(/\s+/g, "\\s*");
         const re = new RegExp(`${escapedLabel}:\\s*(.+?)${BOUNDARY}`, "i");
@@ -128,7 +128,7 @@ async function fetchPdpData(pdpUrl, apiKey) {
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, model, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "65caf441e3d532533fc4af93002263b9";
+  const apiKey = process.env.SCRAPER_API_KEY || "7260a6ebef2b9568767d0c2cb1c03515";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];

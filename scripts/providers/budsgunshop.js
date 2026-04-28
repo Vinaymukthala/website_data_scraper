@@ -104,7 +104,7 @@ async function fetchPdpData(pdpUrl, apiKey) {
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, model, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "65caf441e3d532533fc4af93002263b9";
+  const apiKey = process.env.SCRAPER_API_KEY || "7260a6ebef2b9568767d0c2cb1c03515";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
@@ -112,7 +112,7 @@ export async function scrape({ page, query, model, firearmType }) {
 
   const keywords = extractKeywords(query);
 
-  const searchUrl = `https://www.budsgunshop.com/search?q=${encodeURIComponent(query)}`;
+  const searchUrl = `https://www.budsgunshop.com/search.php/type/firearms/q/${encodeURIComponent(query)}/`;
   console.log(`[${sourceName}] ${searchUrl} (via ScraperAPI)`);
 
   let html;

@@ -143,7 +143,6 @@ function normalizeRow(row, brand, caliber, model) {
     condition,
     pageUrl,
     title,
-    description,
     brand: finalBrand,
     model: finalModel,
     caliber: finalCaliber,
@@ -152,6 +151,11 @@ function normalizeRow(row, brand, caliber, model) {
       original: price,
     },
   };
+
+  // Only add description if it has values
+  if (description) {
+    result.description = description;
+  }
 
   // Only add attributes object if it has values
   if (Object.keys(attributes).length > 0) {
