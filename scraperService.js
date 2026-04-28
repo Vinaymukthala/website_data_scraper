@@ -17,7 +17,8 @@ import {
   isAccessory,
   extractKeywords,
   isRelevant,
-  parseUsdPrice
+  parseUsdPrice,
+  cleanDescription
 } from "./scripts/providers/_util.js";
 
 // ── Provider registry ────────────────────────────────────────────────────────
@@ -96,7 +97,12 @@ function normalizeRow(row, brand, caliber, model) {
     return null; // Mandatory title
   }
 
-  const description = row.description ? String(row.description).trim() : "";
+  // Post-PDP accessory check — final safety net
+  if (isAccessory(title)) {
+    return null;
+  }
+
+  const description = cleanDescription(row.description || "");
 
   let condition = String(row.condition || "Unknown");
   const sourceName = String(row.sourceName || "unknown");
@@ -110,7 +116,28 @@ function normalizeRow(row, brand, caliber, model) {
   const finalCaliber = row.caliber ? String(row.caliber).trim() : caliber;
   const finalModel = row.model ? String(row.model).trim() : model;
 
-  return {
+  // Collect all extra PDP attributes dynamically — only include non-empty values
+  // CORE_KEYS: fields already at top level or noise fields to exclude
+  const CORE_KEYS = new Set([
+    "sourceName", "condition", "conditionType", "pageUrl", "title",
+    "description", "brand", "model", "caliber", "price",
+    // Internal fields leaked from providers
+    "priceText", "rawTitle", "href", "pageUrl",
+    // Noise: not useful gun attributes
+    "serial", "upc", "gtin", "sku", "mpn", "mfgModelNo", "shipping",
+    "itemCondition", "gunName", "type", "itemGroup", "family", "category",
+    // Seller metadata
+    "company", "firstName", "lastName", "fax", "activeListings", "returnPolicy",
+    "checkPayments", "layawayOption",
+  ]);
+  const attributes = {};
+  for (const [key, val] of Object.entries(row)) {
+    if (CORE_KEYS.has(key)) continue;
+    const v = val != null ? String(val).trim() : "";
+    if (v) attributes[key] = v;
+  }
+
+  const result = {
     sourceId: "000",
     sourceName,
     condition,
@@ -125,6 +152,13 @@ function normalizeRow(row, brand, caliber, model) {
       original: price,
     },
   };
+
+  // Only add attributes object if it has values
+  if (Object.keys(attributes).length > 0) {
+    result.attributes = attributes;
+  }
+
+  return result;
 }
 
 function computeOfferValue(sources) {
@@ -168,7 +202,7 @@ async function scrapeFirearm(input) {
 
   const headless = process.env.HEADLESS !== "false";
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH?.trim() || undefined;
-  const timeoutMs = Number(process.env.SCRAPE_TIMEOUT_MS) || 10000;
+  const timeoutMs = Number(process.env.SCRAPE_TIMEOUT_MS) || 45000;
 
   const startedAt = Date.now();
 
@@ -249,10 +283,16 @@ async function scrapeFirearm(input) {
       }
     }
 
-    if (process.env.TRACK_LATENCY === 'true' && providerLatencies.length > 0) {
-      console.log(`\n--- Latency Tracking for: ${QUERY} ---`);
-      providerLatencies.forEach(p => console.log(`  ${p.name}: ${p.ms}ms`));
-      console.log(`------------------------------------------------`);
+    // Always log per-provider timing
+    if (providerLatencies.length > 0) {
+      console.log(`\n--- Per-Provider Timing ---`);
+      providerLatencies
+        .sort((a, b) => a.ms - b.ms)
+        .forEach(p => {
+          const status = errors[p.name] ? 'FAIL' : ' OK ';
+          console.log(`  [${status}] ${p.name.padEnd(22)} ${String(p.ms).padStart(6)}ms`);
+        });
+      console.log(`---------------------------`);
     }
   } finally {
     await browser.close().catch(() => { });
@@ -290,7 +330,7 @@ async function scrapeFirearm(input) {
         }
       }
 
-      if (isExplicitPart) {
+      if (isExplicitPart && row.sourceName !== "truegunvalue") {
           return false;
       }
 
@@ -309,11 +349,14 @@ async function scrapeFirearm(input) {
       }
 
       // Centralized safety net: filter out accessories and irrelevant items
-      if (!isStrictMatch && isAccessory(title, BRAND)) {
-        return false;
-      }
-      if (!isStrictMatch && !isRelevant(title, keywords, row.sourceName, MODEL)) {
-        return false;
+      // Skip for truegunvalue — their listings are confirmed firearms
+      if (row.sourceName !== "truegunvalue") {
+        if (!isStrictMatch && isAccessory(title, BRAND)) {
+          return false;
+        }
+        if (!isStrictMatch && !isRelevant(title, keywords, row.sourceName, MODEL)) {
+          return false;
+        }
       }
 
       // Special rule for PSA: Brand and Model MUST be in the title

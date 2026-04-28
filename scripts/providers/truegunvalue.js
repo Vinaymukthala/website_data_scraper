@@ -71,16 +71,39 @@ function listingsFromScrapedText(text, searchModel) {
       }
     }
 
+    // Extract caliber
+    let caliber = "";
+    const calMatch = chunk.match(/CALIBER:\s*([^\t\r\n]+)/);
+    if (calMatch) caliber = calMatch[1].trim();
+
+    // Extract manufacturer
+    let manufacturer = "";
+    const manMatch = chunk.match(/MANUFACTURER:\s*([^\t\r\n]+)/);
+    if (manMatch) manufacturer = manMatch[1].trim();
+
     // Extract the title line (usually 1-2 lines before the PRICE line)
     let title = "";
-    if (i >= 1) {
-      const prevLine = lines[i - 1].trim();
-      if (prevLine.length > 5 && !prevLine.startsWith("PRICE:") && !prevLine.startsWith("CONDITION:")) {
+    for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
+      const prevLine = lines[j].trim();
+      if (prevLine.length > 10
+        && !prevLine.startsWith("PRICE:")
+        && !prevLine.startsWith("CONDITION:")
+        && !prevLine.startsWith("SOLD:")
+        && !prevLine.startsWith("LOCATION:")
+        && !prevLine.startsWith("CALIBER:")
+        && !prevLine.startsWith("CAPACITY:")
+      ) {
         title = prevLine;
+        break;
       }
     }
 
-    out.push({ price, condition, model, title });
+    // Fallback title from structured fields
+    if (!title && (manufacturer || model)) {
+      title = [manufacturer, model, caliber].filter(Boolean).join(" ");
+    }
+
+    out.push({ price, condition, model, title, caliber, manufacturer });
   }
   return out;
 }
@@ -99,17 +122,19 @@ function conditionTypeFromCondition(conditionRaw) {
   return "UNKNOWN";
 }
 
-export async function scrape({ page, query, firearmType }) {
+export async function scrape({ page, query, firearmType, model }) {
   const categoryKey = FIREARM_TYPE_TO_CATEGORY[String(firearmType || "").trim().toUpperCase()];
   if (!categoryKey) return [];
   const categoryValue = CATEGORY_SELECT_VALUE[categoryKey];
   const pdpUrl = trueGunValueResultsUrl(categoryValue, query);
 
-  // Extract the model from the query for filtering
-  // query is typically "GLOCK 19 9MM" — the model is the middle part(s)
-  const queryParts = query.split(/\s+/);
-  const searchModel = queryParts.length >= 2 ? queryParts.slice(1, -1).join(" ") : "";
+  // Use the model parameter directly (e.g. "10/22", "P320", "19")
+  // Fallback to extracting from query if model not provided
+  const searchModel = model
+    ? String(model).trim()
+    : (query.split(/\s+/).length >= 2 ? query.split(/\s+/).slice(1, -1).join(" ") : "");
 
+  console.log(`[${sourceName}] ${pdpUrl}`);
   await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 10_000 });
   await ensureNotBlocked(page, `${sourceName}: after navigation`);
 
@@ -122,8 +147,8 @@ export async function scrape({ page, query, firearmType }) {
   const allListings = listingsFromScrapedText(text, searchModel);
   console.log(`[${sourceName}] Parsed ${allListings.length} matching listing(s) (model filter: "${searchModel}").`);
 
-  return allListings.map((l) => {
-    const { brand, caliber } = extractBrandAndCaliber(l.title);
+  return allListings.slice(0, 4).map((l) => {
+    const extracted = extractBrandAndCaliber(l.title);
 
     return {
       sourceName,
@@ -133,8 +158,8 @@ export async function scrape({ page, query, firearmType }) {
       title: l.title || null,
       description: "",
       model: l.model || "",
-      brand,
-      caliber,
+      brand: l.manufacturer || extracted.brand,
+      caliber: l.caliber || extracted.caliber,
       price: { currency: "USD", original: l.price },
     };
   });

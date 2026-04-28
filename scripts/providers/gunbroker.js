@@ -15,12 +15,14 @@ import {
   isAccessory,
   extractKeywords,
   isRelevant,
-  extractBrandAndCaliber
+  normalizeCondition,
+  extractSpecsFromHtml
 } from "./_util.js";
 
 export const sourceName = "gunbroker";
 
 const MAX_LISTINGS = Number(process.env.GB_MAX_LISTINGS) || 10;
+const PDP_LIMIT = 3;
 
 /**
  * Fetch HTML from a URL via ScraperAPI (plain — no render=true needed for GunBroker).
@@ -34,17 +36,174 @@ async function fetchViaScraperAPI(targetUrl, apiKey) {
   return await response.text();
 }
 
+/**
+ * Fetch a single PDP page via ScraperAPI and extract description + condition.
+ */
+async function fetchPdpData(pdpUrl, apiKey) {
+  try {
+    const html = await fetchViaScraperAPI(pdpUrl, apiKey);
+    const $ = cheerio.load(html);
+
+    let description = "";
+
+    // GunBroker puts seller content in multiple iframe srcdoc attributes.
+    // The actual product description is typically the LONGEST srcdoc.
+    // Noise iframes (layaway, disclaimers) usually START with that text.
+    const NOISE_RE = /layaway|subject to change|shipping rates|terms of sale|payment method|money order|certified check|restocking fee|disclaimer|non-compliance|before placing your order/i;
+
+    const candidates = [];
+    $("iframe.srcdoc-iframe").each((_, el) => {
+      const srcdoc = $(el).attr("srcdoc") || "";
+      if (!srcdoc || srcdoc.length < 50) return;
+
+      const $inner = cheerio.load(srcdoc);
+      const innerText = $inner.text().replace(/\s+/g, " ").trim();
+      if (innerText.length < 30) return;
+
+      // Only skip if noise appears in the FIRST 200 chars (primary noise content)
+      const head = innerText.slice(0, 200);
+      if (NOISE_RE.test(head)) return;
+
+      candidates.push(innerText);
+    });
+
+    // Pick the longest non-noise candidate — that's the real description
+    if (candidates.length > 0) {
+      description = candidates.sort((a, b) => b.length - a.length)[0];
+    }
+
+    // Fallback: meta description
+    if (!description) {
+      const metaDesc = $("meta[name='description']").attr("content") || "";
+      if (metaDesc && metaDesc.length > 20) {
+        description = metaDesc.replace(/\s*:\s*GunBroker.*$/i, "").trim();
+      }
+    }
+
+    // Extract condition from PDP (e.g., "Factory New Condition")
+    let condition = "";
+    const condEl = $(".condition").first();
+    if (condEl.length) {
+      condition = condEl.text().replace(/\s+/g, " ").replace(/condition/i, "").trim();
+    }
+
+    description = description.replace(/\s+/g, " ").trim();
+
+    // GunBroker-specific spec extraction:
+    // 1. dataLayer script has structured item data
+    // 2. DOM has label/value span pairs (Manufacturer → RUGER, Model → 10/22 CARBINE, etc.)
+    const specs = {};
+
+    // Strategy 1: Parse dataLayer script for structured item data
+    $("script").each((_, el) => {
+      const text = $(el).html() || "";
+      if (text.includes("dataLayer.push") && text.includes("itemID")) {
+        const itemMatch = text.match(/item:\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}/);
+        if (itemMatch) {
+          const itemText = itemMatch[1];
+          const fieldMap = {
+            manufacturer: "brand", model: "model", caliber: "caliber",
+            gauge: "gauge", action: "action", barrel_length: "barrelLength",
+            category: "category",
+          };
+          for (const [field, key] of Object.entries(fieldMap)) {
+            const m = itemText.match(new RegExp(`${field}\\s*:\\s*"([^"]*)"`, "i"));
+            if (m && m[1].trim()) specs[key] = m[1].trim();
+          }
+        }
+      }
+    });
+
+    // Strategy 2: DOM label/value pairs (span elements where label text is followed by value)
+    $("span, div, td, th").each((_, el) => {
+      const text = $(el).text().trim();
+      if (/^(Manufacturer|Caliber|Model|Action|Barrel Length|Capacity|Gauge|Condition)$/i.test(text)) {
+        const value = $(el).next().text().trim();
+        if (value && value.length < 80) {
+          const key = text.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
+          if (key === "manufacturer") { if (!specs.brand) specs.brand = value; }
+          else if (!specs[key]) specs[key] = value;
+        }
+      }
+    });
+
+    // Strategy 3: Parse SPECIFICATIONS block from iframe srcdoc
+    //   GunBroker sellers embed detailed specs inside iframe srcdoc HTML
+    //   Format: "SPECIFICATIONS:\nMANUFACTURER: Ruger\nMODEL: 10/22\nCALIBER/GAUGE: 22 LR\n..."
+    $("iframe.srcdoc-iframe").each((_, el) => {
+      const srcdoc = $(el).attr("srcdoc") || "";
+      if (!srcdoc || !/SPECIFICATION/i.test(srcdoc)) return;
+
+      const $inner = cheerio.load(srcdoc);
+      const text = $inner.text();
+
+      // Extract everything after "SPECIFICATIONS:" 
+      const specMatch = text.match(/SPECIFICATIONS?\s*:?\s*([\s\S]+)/i);
+      if (!specMatch) return;
+      const specBlock = specMatch[1];
+
+      // Known GunBroker spec labels (comprehensive to prevent boundary bleed)
+      const GB_LABELS = [
+        "MANUFACTURER", "MODEL", "MFG MODEL NO", "FAMILY", "TYPE",
+        "ITEM GROUP", "ACTION", "CALIBER/GAUGE", "CALIBER", "GAUGE",
+        "FINISH", "FINISH TYPE", "STOCK", "STOCK/GRIPS", "BARREL",
+        "BARREL LENGTH", "OVERALL LENGTH", "DRILLED / TAPPED",
+        "RATE-OF-TWIST", "CAPACITY", "# OF MAGAZINES", "MAG DESCRIPTION",
+        "SIGHTS", "SIGHT TYPE", "OPTICS/SIGHTS", "MARKINGS", "SERIAL",
+        "UPC", "WEIGHT", "SAFETY", "FRAME", "TRIGGER",
+        "THREAD PATTERN", "SPECIAL FEATURE", "SHIPPING", "CONDITION",
+        "COUNTRY OF ORIGIN", "ITEM CONDITION",
+      ];
+      // Build boundary regex
+      const labelPattern = GB_LABELS.map(l => l.replace(/[/\\#]/g, "\\$&").replace(/\s+/g, "\\s*")).join("|");
+      const BOUNDARY = `(?=(?:${labelPattern})\\s*:|$)`;
+
+      for (const label of GB_LABELS) {
+        const escaped = label.replace(/[/\\#]/g, "\\$&").replace(/\s+/g, "\\s*");
+        const re = new RegExp(`${escaped}\\s*:\\s*(.+?)${BOUNDARY}`, "is");
+        const m = specBlock.match(re);
+        if (m && m[1].trim()) {
+          // Normalize label to camelCase
+          let key = label.toLowerCase()
+            .replace(/[/#]/g, " ")
+            .replace(/\s+(.)/g, (_, c) => c.toUpperCase())
+            .replace(/^\w/, c => c.toLowerCase());
+          // Normalize aliases
+          if (key === "manufacturer") key = "brand";
+          if (key === "caliberGauge" || key === "gauge") key = specs.caliber ? key : "caliber";
+          if (key === "barrel" && !specs.barrelLength) key = "barrelLength";
+          if (key === "stockGrips") key = "stock";
+          if (key === "rateOfTwist") key = "twist";
+          if (key === "ofMagazines") key = "magazineCount";
+          
+          if (!specs[key]) specs[key] = m[1].trim();
+        }
+      }
+    });
+
+    // Strategy 4: Fallback to generic extractSpecsFromHtml
+    const genericSpecs = extractSpecsFromHtml($);
+    for (const [k, v] of Object.entries(genericSpecs)) {
+      if (v && !specs[k]) specs[k] = v;
+    }
+
+    return { description, condition, ...specs };
+  } catch (e) {
+    console.warn(`[${sourceName}] PDP fetch failed: ${e.message}`);
+    return { description: "", condition: "" };
+  }
+}
+
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, model, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "a96f83295b5cb373ae7d5f5446cc96aa";
+  const apiKey = process.env.SCRAPER_API_KEY || "65caf441e3d532533fc4af93002263b9";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
   }
 
   const keywords = extractKeywords(query);
-  const minMatch = Math.min(2, keywords.length);
 
   // Sort=13 = Buy Now items,
   const searchUrl = `https://www.gunbroker.com/all/search?keywords=${encodeURIComponent(query)}&Sort=13`;
@@ -64,12 +223,6 @@ export async function scrape({ page, query, model, firearmType }) {
     return [];
   }
 
-  // Parse HTML with cheerio
-  // GunBroker structure:
-  //   div.listing[id="item-XXXXXXXXXX"]
-  //     div.listing-text  → title (repeated twice, take first unique)
-  //     div.listing-meta  → "Qty: X Item #:XXXXXXXXXX"
-  //   Price is in the card text as "Price $XXX.XX"
   const $ = cheerio.load(html);
   const raw = [];
 
@@ -78,10 +231,8 @@ export async function scrape({ page, query, model, firearmType }) {
     const id = ($card.attr("id") || "").replace("item-", "").trim();
     if (!id) return;
 
-    // Title comes from listing-text, which repeats — take the trimmed first line
     const titleEl = $card.find(".listing-text").first();
     const titleRaw = (titleEl.text() || "").trim().replace(/\s+/g, " ");
-    // listing-text repeats the title twice (e.g. "GLOCK 19 GLOCK 19"), deduplicate
     const half = Math.ceil(titleRaw.length / 2);
     const half1 = titleRaw.slice(0, half).trim();
     const half2 = titleRaw.slice(half).trim();
@@ -90,7 +241,6 @@ export async function scrape({ page, query, model, firearmType }) {
 
     if (!cleanTitle || cleanTitle.length < 3) return;
 
-    // Price: find "Price $XXX.XX" pattern in the full card text
     const cardText = $card.text();
     const priceMatch = cardText.match(/Price\s+(\$[\d,]+\.?\d{0,2})/);
     const priceText = priceMatch ? priceMatch[1] : "";
@@ -123,28 +273,40 @@ export async function scrape({ page, query, model, firearmType }) {
 
   console.log(`[${sourceName}] After site-specific filters: ${relevant.length} relevant listing(s).`);
 
+  // Take top PDP_LIMIT listings for PDP extraction (parallel)
+  const pdpTargets = relevant.slice(0, PDP_LIMIT);
+  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
+
+  const pdpResults = await Promise.all(
+    pdpTargets.map(l => fetchPdpData(l.url, apiKey))
+  );
+
   // Build results
   const results = [];
-  for (const l of relevant.slice(0, MAX_LISTINGS)) {
+  for (let i = 0; i < pdpTargets.length; i++) {
+    const l = pdpTargets[i];
+    const pdp = pdpResults[i] || {};
     const p = parseUsdPrice(l.price);
     if (p == null || p <= 0) continue;
 
     const upper = l.title.toUpperCase();
-    let condition = "Used"; // GunBroker is mostly used/private-seller
-    if (/\bNEW\b/.test(upper) && !/\bUSED\b/.test(upper)) condition = "New";
-    if (/\bNIB\b/.test(upper) || /\bNEW IN BOX\b/.test(upper)) condition = "New";
-
-    const { brand, caliber } = extractBrandAndCaliber(l.title, keywords);
+    let rawCond = pdp.condition || "";
+    if (!rawCond) {
+      if (/\bNEW\b/.test(upper) && !/\bUSED\b/.test(upper)) rawCond = "New";
+      else if (/\bNIB\b/.test(upper) || /\bNEW IN BOX\b/.test(upper)) rawCond = "New";
+      else rawCond = "Used";
+    }
 
     results.push({
       sourceName,
-      condition,
       pageUrl: l.url,
       title: l.title.slice(0, 200) || null,
-      description: l.description || "",
-      model: model || "",
-      brand,
-      caliber,
+      description: (pdp.description || "").toLowerCase(),
+      ...pdp,
+      condition: normalizeCondition(rawCond),
+      model: pdp.model || model || "",
+      caliber: pdp.caliber || "",
+      brand: pdp.brand || "",
       price: { currency: "USD", original: p },
     });
   }

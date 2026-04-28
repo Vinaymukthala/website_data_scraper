@@ -21,7 +21,8 @@ import {
   toAbsoluteUrl,
   isAccessory,
   extractKeywords,
-  isRelevant
+  isRelevant,
+  normalizeCondition
 } from "./_util.js";
 
 export const sourceName = "simpsonltd";
@@ -169,18 +170,22 @@ async function scrapeDetailPage(page, href) {
       if (m) priceText = "$" + m[1];
     }
 
+    // Extract ALL label:value specs from body text
     const specs = {};
-    const specPatterns = [
-      { key: "blue",    re: /\bBlue:\s*([^\n\r,]+)/i },
-      { key: "bore",    re: /\bBore:\s*([^\n\r,]+)/i },
-      { key: "caliber", re: /\bCal(?:iber)?:\s*([^\n\r,]+)/i },
-      { key: "barrel",  re: /\bBarrel:\s*([^\n\r,]+)/i },
-      { key: "action",  re: /\bAction:\s*([^\n\r,]+)/i },
-      { key: "stock",   re: /\bStock:\s*([^\n\r,]+)/i },
-    ];
-    for (const { key, re } of specPatterns) {
-      const m = bodyText.match(re);
-      if (m) specs[key] = m[1].trim().slice(0, 50);
+    const SKIP_LABELS = /^(price|shipping|sku|call|email|contact|simpson|privacy|address|phone)/i;
+    const lines = bodyText.split(/\n/);
+    for (const line of lines) {
+      const match = line.trim().match(/^([A-Za-z][A-Za-z\s/]{1,25}):\s*(.+)/);
+      if (match) {
+        const label = match[1].trim();
+        const value = match[2].trim();
+        if (label.length > 1 && value.length > 0 && value.length < 150 && !SKIP_LABELS.test(label)) {
+          let key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
+          // Normalize aliases
+          if (key === "cal") key = "caliber";
+          if (!specs[key]) specs[key] = value;
+        }
+      }
     }
 
     const conditionParts = [];
@@ -192,7 +197,7 @@ async function scrapeDetailPage(page, href) {
     }
     const condition = conditionParts.join(", ") || "Unknown";
 
-    return { title, sku, priceText, condition, specs, pageUrl };
+    return { title, priceText, condition, description: "", pageUrl, ...specs };
   }, href);
 
   return data;
@@ -244,73 +249,64 @@ export async function scrape({ page, query, model, firearmType }) {
     return !isAccessory(l.rawTitle) && isRelevant(l.rawTitle, keywords, sourceName, model);
   });
 
-  listings = relevant.slice(0, MAX_LISTINGS);
+  const PDP_LIMIT = 3;
+  const pdpTargets = relevant.slice(0, PDP_LIMIT);
 
-  if (listings.length === 0) {
+  if (pdpTargets.length === 0) {
     console.warn(`[${sourceName}] No firearm listings found after filtering.`);
     return [];
   }
 
-  // ── Try quick results from listing page ────────────────────────────
-  const quickResults = listings
-    .map((p) => {
-      const pageUrl = toAbsoluteUrl(BASE_URL, p.href);
-      const price = parseUsdPrice(p.priceText);
-      if (!pageUrl || price == null || price <= 0) return null;
-
-      const title = cleanTitle(p.rawTitle);
-      return {
-        sourceName,
-        condition: p.specs.stock || conditionFromText(title) || "Unknown",
-        pageUrl,
-        title: title || null,
-        description: "",
-        model: model || "",
-        specs: p.specs || {},
-        price: { currency: "USD", original: price },
-      };
-    })
-    .filter(Boolean);
-
-  if (quickResults.length > 0) {
-    console.log(`[${sourceName}] Got ${quickResults.length} result(s) from listing page.`);
-    return quickResults;
-  }
-
-  // ── Visit detail pages for missing prices ──────────────────────────
-  console.log(`[${sourceName}] Visiting detail pages for prices…`);
+  console.log(`[${sourceName}] Visiting ${pdpTargets.length} detail pages sequentially...`);
   const results = [];
 
-  for (let i = 0; i < listings.length; i++) {
-    const listing = listings[i];
+  for (let i = 0; i < pdpTargets.length; i++) {
+    const listing = pdpTargets[i];
     const pageUrl = toAbsoluteUrl(BASE_URL, listing.href);
     if (!pageUrl) continue;
 
-    console.log(`[${sourceName}] [${i + 1}/${listings.length}] Scraping: ${pageUrl}`);
+      console.log(`[${sourceName}] [${i + 1}/${pdpTargets.length}] Scraping: ${pageUrl}`);
 
     try {
       const data = await scrapeDetailPage(page, pageUrl);
 
-      if (isAccessory(data.title)) {
-        console.log(`[${sourceName}]   → Accessory: "${data.title}" — skipping.`);
+      const finalTitle = data.title || cleanTitle(listing.rawTitle) || "";
+      if (isAccessory(finalTitle)) {
+        console.log(`[${sourceName}]   → Accessory: "${finalTitle}" — skipping.`);
         continue;
       }
 
-      const price = parseUsdPrice(data.priceText);
+      const price = parseUsdPrice(data.priceText || listing.priceText);
       if (price == null || price <= 0) {
         console.log(`[${sourceName}]   → No valid price — skipping.`);
         continue;
       }
 
+      // Extract description from PDP page text
+      let description = data.description || "";
+      if (!description) {
+        // Try to extract from body text on PDP
+        try {
+          description = await page.evaluate(() => {
+            const mainArea = document.querySelector("main, #main, .product-detail, .product-page, article") || document.body;
+            const ps = Array.from(mainArea.querySelectorAll("p"))
+              .map(p => (p.innerText || p.textContent || "").trim())
+              .filter(t => t.length > 50 && !t.includes("Simpson Limited") && !t.includes("Privacy Policy") && !t.includes("Call us at"));
+            if (ps.length > 0) return ps.sort((a, b) => b.length - a.length)[0];
+            return "";
+          });
+        } catch { description = ""; }
+      }
+
       results.push({
         sourceName,
-        condition: data.condition || conditionFromText(data.title) || "Unknown",
         pageUrl,
-        title: data.title || cleanTitle(listing.rawTitle) || null,
-        description: "",
-        model: model || "",
-        sku: data.sku || null,
-        specs: data.specs || {},
+        title: finalTitle || null,
+        description: (description || "").toLowerCase().replace(/\s+/g, " "),
+        ...data,
+        ...listing.specs,
+        condition: normalizeCondition(data.condition),
+        model: data.model || model || "",
         price: { currency: "USD", original: price },
       });
 
@@ -319,7 +315,7 @@ export async function scrape({ page, query, model, firearmType }) {
       console.warn(`[${sourceName}]   → Error: ${err?.message}`);
     }
 
-    if (i < listings.length - 1) await delay(DETAIL_DELAY_MS);
+    if (i < pdpTargets.length - 1) await delay(DETAIL_DELAY_MS);
   }
 
   console.log(`[${sourceName}] Done — ${results.length} result(s).`);

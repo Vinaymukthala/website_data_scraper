@@ -6,7 +6,155 @@
  *   conditionFromText(text)     — infer New/Used/Unknown from description
  *   toAbsoluteUrl(base, href)   — safely resolve a relative URL
  *   ensureNotBlocked(page, ctx) — throw if page is a bot-block/challenge page
+ *   cleanDescription(text)      — clean raw scraped description text
  */
+
+// ── Description cleaning ─────────────────────────────────────────────────────
+
+/**
+ * Clean a raw scraped description string by removing CSS noise,
+ * navigation boilerplate, HTML entities, prices, and other junk.
+ */
+export function cleanDescription(raw) {
+  if (!raw) return "";
+  let d = String(raw);
+
+  // 1. Strip CSS blocks (PSA PageBuilder inline styles)
+  d = d.replace(/#html-body\s*\[data-pb-style=[^\]]*\]\{[^}]*\}/g, "");
+
+  // 2. Strip HTML entities
+  d = d.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  d = d.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
+
+  // 3. Truncate at legal / boilerplate boundaries
+  //    Seller descriptions often have real product info followed by walls of
+  //    terms, shipping policy, layaway, returns, etc.  Cut at the first match.
+  const LEGAL_BOUNDARY = /\b(terms and conditions|terms of sale|shipping policy|return policy|layaway option|legal responsibility|payment terms|credit card payments must|all federal firearms|non-returnable items|listing accuracy|check payments|condition of returns|restocking fee|buyers are responsible|please read before|general shipping|our mission statement|no sales to|we do not ship|we will not ship|disclaimer|warranty information|about us|about our|your adventure starts|we provide outstanding)\b/i;
+  const boundaryIdx = d.search(LEGAL_BOUNDARY);
+  if (boundaryIdx >= 0 && boundaryIdx <= 30) {
+    // Entire description is boilerplate
+    return "";
+  } else if (boundaryIdx > 30) {
+    d = d.slice(0, boundaryIdx).trim();
+  }
+
+  // 4. Remove navigation / boilerplate phrases
+  const NOISE_PHRASES = [
+    /\b(add to cart|add to wishlist|buy now|add to compare)\b/gi,
+    /\b(back|go back|return to)\s+(item|product|shop|store|search|results)\b/gi,
+    /\bitem\s*number:\s*\S+/gi,
+    /\bnumber:\s*\S+/gi,
+    /\bsku:\s*\S+/gi,
+    /\bsn:\s*\S+/gi,
+    /\bupc:?\s*#?\s*\d+/gi,
+    /\bmfr\s*#?\s*:?\s*\S+/gi,
+    /\bmanf\.\s*part\s*#?\s*:?\s*\S*/gi,
+    /\b(in stock|out of stock|sold out|limited stock)\b/gi,
+    /\bquantity\b/gi,
+    /\b(houston|dallas)\s+location\.?\b/gi,
+    /\bfree shipping\b/gi,
+    /\bseller\s*#?\s*:?\s*\d+/gi,
+    /\bguns\s*international\s*#?\s*:?\s*\d+/gi,
+    /\bprice:\s*\$[\d,.]+/gi,
+    /\bshipping:\s*\$[\d,.]+/gi,
+    /\$[\d,]+\.?\d{0,2}/g,
+    /\(stock photo\)/gi,
+    /\b(please call|please have|if you are interested|for sale from)\b.*$/gim,
+    /\bplease add for shipping\b.*$/gim,
+    /\bpictures show what you get\b.*$/gim,
+    // PSA: "product details details" prefix
+    /^product\s+details\s+details\s*/i,
+    // CollectorFirearms: leading "back" and location suffixes
+    /^back\s+/i,
+    /\b(houston|dallas|galveston)\s+location\.?\s*$/gim,
+  ];
+
+  for (const re of NOISE_PHRASES) {
+    d = d.replace(re, " ");
+  }
+
+  // 5. Collapse whitespace & lowercase
+  d = d.replace(/\s+/g, " ").trim().toLowerCase();
+
+  // 6. Strip leading punctuation/dots (e.g. ". ruger 10/22...")
+  d = d.replace(/^[\s.,;:!?*\-–—]+/, "").trim();
+
+  return d;
+}
+
+// ── PDP Spec Extraction ──────────────────────────────────────────────────────
+
+/**
+ * Extract ALL structured specs from a Cheerio-loaded PDP page.
+ * Tries multiple strategies:
+ *   1. Magento additional-attributes table
+ *   2. Generic table rows (th/td)
+ *   3. dt/dd definition list pairs
+ *   4. <li> items with "Label: Value" pattern (PSA/GrabAGun style)
+ *
+ * Returns a dynamic object — only non-empty values, camelCase keys.
+ * E.g. { caliber: "22 LR", model: "10/22", brand: "Ruger", action: "Semi-Auto", ... }
+ */
+export function extractSpecsFromHtml($, scope) {
+  const specs = {};
+  const root = scope ? $(scope) : $.root();
+
+  // Skip noise labels that are not gun attributes
+  const SKIP_LABELS = /^(sku|upc|mpn|gtin|product|price|qty|availability|weight|shipping|color|image|url|stock|add to|review|rating|share|compare)/i;
+
+  // Helper: set spec only if not already set and value is meaningful
+  const setSpec = (rawLabel, value) => {
+    if (!rawLabel || !value || value.length > 150) return;
+    const label = rawLabel.trim();
+    if (label.length < 2 || SKIP_LABELS.test(label)) return;
+    // Convert to camelCase key: "Barrel Length" → "barrelLength"
+    const key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
+    if (!specs[key]) specs[key] = value.trim();
+  };
+
+  // Strategy 1: Magento additional-attributes table (most reliable)
+  root.find(".data.table.additional-attributes tr, #product-attribute-specs-table tr").each((_, row) => {
+    const label = $(row).find("th").text().trim();
+    const value = $(row).find("td").text().trim();
+    setSpec(label, value);
+  });
+
+  // Strategy 2: Generic table rows (th-td or td-td) — scoped to product area
+  root.find(".product-info-main table tr, .product-details table tr, table.specs tr").each((_, row) => {
+    const cells = $(row).find("th, td");
+    if (cells.length >= 2) {
+      const label = $(cells[0]).text().trim();
+      const value = $(cells[1]).text().trim();
+      setSpec(label, value);
+    }
+  });
+
+  // Strategy 3: dt/dd definition list pairs
+  root.find("dt").each((_, el) => {
+    const label = $(el).text().trim();
+    const value = $(el).next("dd").text().trim();
+    setSpec(label, value);
+  });
+
+  // Strategy 4: <li> items with "Label: Value" pattern
+  const descArea = root.find(
+    ".product.attribute.description, .product_description, " +
+    "[itemprop='description'], #tab-description, .product-description"
+  );
+  descArea.find("li").each((_, el) => {
+    const text = $(el).text().trim();
+    const match = text.match(/^([A-Za-z][A-Za-z\s]{1,30}):\s*(.+)/);
+    if (match) setSpec(match[1], match[2]);
+  });
+
+  // Normalize common aliases
+  if (specs.manufacturer && !specs.brand) { specs.brand = specs.manufacturer; delete specs.manufacturer; }
+  if (specs.gauge && !specs.caliber) { specs.caliber = specs.gauge; delete specs.gauge; }
+  if (specs.cartridge && !specs.caliber) { specs.caliber = specs.cartridge; delete specs.cartridge; }
+  if (specs.chambering && !specs.caliber) { specs.caliber = specs.chambering; delete specs.chambering; }
+
+  return specs;
+}
 
 // ── Price parsing ────────────────────────────────────────────────────────────
 
@@ -27,6 +175,22 @@ export function conditionFromText(text) {
   if (/\blike new\b/.test(s)) return "Used";
   if (/\bnew\b|\bnib\b/.test(s)) return "New";
   return "Unknown";
+}
+
+/**
+ * Normalize a raw condition string into one of the standard terms:
+ * New, Excellent, Very Good, Good, Fair, Used
+ */
+export function normalizeCondition(rawText) {
+  const up = String(rawText || "").toUpperCase();
+  if (!up || up === "UNKNOWN") return "Used";
+  if (up.includes("NIB") || up.includes("NEW IN BOX") || up.includes("UNFIRED") || up.includes("FACTORY NEW") || up === "NEW") return "New";
+  if (up.includes("LIKE NEW") || up.includes("MINT") || up.includes("EXCELLENT") || up.includes("99%")) return "Excellent";
+  if (up.includes("VERY GOOD") || up.includes("98%")) return "Very Good";
+  if (up.includes("GOOD") || up.includes("FINE")) return "Good";
+  if (up.includes("FAIR") || up.includes("POOR")) return "Fair";
+  if (up.includes("NEW") && !up.includes("USED")) return "New";
+  return "Used";
 }
 
 // ── URL helper ───────────────────────────────────────────────────────────────
@@ -99,7 +263,9 @@ export function isAccessory(title, searchedBrand = "") {
     const partRe = new RegExp(`\\b${part}[S]?\\b`, "i");
     if (partRe.test(upper)) {
       // If it has "Pistol", "Rifle", "Revolver", "Shotgun", it's probably a gun
-      if (/\b(PISTOL|RIFLE|REVOLVER|SHOTGUN|HANDGUN)\b/i.test(upper)) continue;
+      // BUT: "Pistol Grip" is a part descriptor, not a gun type
+      if (/\b(RIFLE|REVOLVER|SHOTGUN|HANDGUN)\b/i.test(upper)) continue;
+      if (/\bPISTOL\b/i.test(upper) && !/\bPISTOL\s*GRIP\b/i.test(upper)) continue;
 
       // If it has a caliber AND a barrel length description, it's probably a gun
       // e.g. "6\" Barrel", "3.7\" Barrel"
@@ -110,6 +276,13 @@ export function isAccessory(title, searchedBrand = "") {
       // We block if it looks like a part listing
       if (new RegExp(`\\b(FOR|FITS)\\b.*\\b${part}\\b`, "i").test(upper)) {
         console.log(`[debug] Flagged as accessory (Fits/For ${part}): ${title}`);
+        return true;
+      }
+
+      // If the title ENDS with the part keyword, it's almost certainly an accessory
+      // e.g. "Mesa Tactical Benelli M4 12 Gauge Urbino Pistol Grip Stock"
+      if (new RegExp(`\\b${part}[S]?\\s*$`, "i").test(upper)) {
+        console.log(`[debug] Flagged as accessory (title ends with ${part}): ${title}`);
         return true;
       }
 

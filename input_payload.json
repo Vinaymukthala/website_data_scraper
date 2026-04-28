@@ -1,10 +1,10 @@
 {
   "quickQuoteRequest": {
     "firearm": {
-      "firearmType": "HANDGUN",
-      "brand": "Sig Sauer",
-      "model": "P320",
-      "caliber": "9mm"
+      "firearmType": "SHOTGUN",
+      "brand": "Benelli",
+      "model": "M4",
+      "caliber": "12 GA"
     }
   }
 }

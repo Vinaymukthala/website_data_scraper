@@ -15,7 +15,7 @@ import {
   isAccessory, 
   extractKeywords, 
   isRelevant,
-  extractBrandAndCaliber
+  normalizeCondition
 } from "./_util.js";
 
 export const sourceName = "collectorfirearms";
@@ -130,7 +130,7 @@ export async function scrape({ page, query, model, firearmType }) {
       const descEl = card.querySelector(
         ".woocommerce-product-details__short-description, .product-short-description, .entry-summary, .entry-content, p"
       );
-      const description = descEl ? (descEl.textContent || "").trim().slice(0, 300) : "";
+      const description = descEl ? (descEl.textContent || "").trim() : "";
 
       out.push({ url: href, title, price: priceText, description });
     }
@@ -153,7 +153,7 @@ export async function scrape({ page, query, model, firearmType }) {
           const m = (parent.textContent || "").match(/\$[\d,]+\.?\d*/);
           if (m) priceText = m[0];
         }
-        const description = parent ? (parent.textContent || "").trim().slice(0, 300) : "";
+        const description = parent ? (parent.textContent || "").trim() : "";
 
         out.push({ url: href, title, price: priceText, description });
       }
@@ -183,26 +183,118 @@ export async function scrape({ page, query, model, firearmType }) {
     return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
   });
 
+  // ── Scrape detail pages sequentially for descriptions ────────────────
+  const pdpDataMap = {};
+  const PDP_LIMIT = 3;
+  const pdpTargets = relevant.slice(0, PDP_LIMIT);
+
+  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) sequentially for descriptions...`);
+
+  const delay = ms => new Promise(res => setTimeout(res, ms));
+
+  for (const listing of pdpTargets) {
+    const pdpUrl = listing.url;
+    try {
+      await delay(200);
+      try {
+        await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+      } catch {
+        // partial load
+      }
+
+      await page.waitForFunction(
+        () => (document.body.innerText || "").length > 100,
+        { timeout: 3000 }
+      ).catch(() => {});
+
+      const data = await page.evaluate(() => {
+        let description = "";
+        const descEl = document.querySelector("#tab-description, .woocommerce-Tabs-panel--description, .product-description, .woocommerce-product-details__short-description");
+        if (descEl) {
+          description = (descEl.innerText || descEl.textContent || "").trim();
+        } else {
+           const summary = document.querySelector(".summary, .entry-summary");
+           if (summary) description = (summary.innerText || summary.textContent || "").trim();
+        }
+        
+        // Remove pricing, SKU, and condition lines
+        description = description
+           .replace(/\b(SKU|Condition|Price):\s*[^\n\r]+/gi, "")
+           .replace(/\$[\d,]+\.?\d*/g, "")
+           .replace(/\s+/g, " ")
+           .trim();
+
+        // Extract specs from WooCommerce attributes table
+        const specs = {};
+        document.querySelectorAll(".woocommerce-product-attributes tr, #tab-additional_information tr").forEach(row => {
+          const label = (row.querySelector("th")?.textContent || "").trim();
+          const value = (row.querySelector("td")?.textContent || "").trim();
+          if (label && value && label.length < 40) {
+            const key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
+            specs[key] = value;
+          }
+        });
+
+        // Extract from product meta
+        const skuEl = document.querySelector(".sku");
+        if (skuEl) specs.sku = skuEl.textContent.trim();
+        
+        // Extract specs from JSON-LD if present
+        document.querySelectorAll('script[type="application/ld+json"]').forEach(el => {
+          try {
+            const data = JSON.parse(el.textContent);
+            if (data["@type"] === "Product") {
+              if (data.brand?.name && !specs.brand) specs.brand = data.brand.name;
+              if (data.model && !specs.model) specs.model = data.model;
+            }
+          } catch {}
+        });
+
+        // Parse structured label:value lines from description text
+        const SKIP_LABELS = /^(price|shipping|payment|item\s*location|location|tax|description|sku|condition|ffl|please|note|we\s)/i;
+        const lines = description.split(/\n|\r/);
+        for (const line of lines) {
+          const match = line.trim().match(/^([A-Za-z][A-Za-z\s/]{1,30}):\s*(.+)/);
+          if (match) {
+            const label = match[1].trim();
+            const value = match[2].trim();
+            if (label.length > 1 && value.length > 0 && value.length < 150 && !SKIP_LABELS.test(label)) {
+              const key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
+              if (key === "manufacturer") { if (!specs.brand) specs.brand = value; }
+              else if (!specs[key]) specs[key] = value;
+            }
+          }
+        }
+
+        return { description, ...specs };
+      });
+
+      pdpDataMap[pdpUrl] = data;
+    } catch (e) {
+      console.warn(`[${sourceName}] PDP failed for ${pdpUrl.substring(pdpUrl.lastIndexOf('/')+1, pdpUrl.lastIndexOf('/')+30)}: ${e.message || e}`);
+    }
+  }
+
   // Build results
   const results = [];
-  for (const l of relevant.slice(0, MAX_LISTINGS)) {
+  for (const l of pdpTargets) {
     const p = parseUsdPrice(l.price);
     if (p == null || p <= 0) continue;
 
+    const pdp = pdpDataMap[l.url] || {};
     const title = cleanTitle(l.title);
-    const condition = extractCondition(l.title, l.description);
-
-    const { brand, caliber } = extractBrandAndCaliber(l.title, keywords);
+    
+    let rawCondition = pdp.condition || extractCondition(l.title, l.description) || "Unknown";
+    const condition = normalizeCondition(rawCondition);
 
     results.push({
       sourceName,
-      condition,
       pageUrl: l.url,
       title: title || null,
-      description: l.description || "",
-      model: model || "",
-      brand,
-      caliber,
+      description: (pdp.description || l.description || "").toLowerCase(),
+      ...pdp,
+      condition,
+      model: pdp.model || model || "",
       price: { currency: "USD", original: p },
     });
   }

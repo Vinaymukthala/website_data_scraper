@@ -14,7 +14,8 @@ import {
   parseUsdPrice, 
   isAccessory, 
   extractKeywords, 
-  isRelevant 
+  isRelevant,
+  normalizeCondition 
 } from "./_util.js";
 
 export const sourceName = "gunsinternational";
@@ -56,8 +57,11 @@ export async function scrape({ page, query, model, firearmType }) {
     }
   });
 
-  // Navigate — domcontentloaded fires fast; listing data is server-rendered HTML
-  await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 12_000 });
+  try {
+    await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 15_000 });
+  } catch {
+    // Proceed if partial load
+  }
 
   // Quick Cloudflare check
   const blocked = await page.evaluate(() =>
@@ -118,7 +122,7 @@ export async function scrape({ page, query, model, firearmType }) {
       if (cm) cond = cm[1];
 
       const descEl = box.querySelector(".description, .desc, p");
-      const description = descEl ? (descEl.textContent || "").trim().slice(0, 300) : "";
+      const description = descEl ? (descEl.textContent || "").trim() : "";
 
       out.push({ url: href, title: title.slice(0, 200), price, condition: cond, description });
     }
@@ -182,18 +186,115 @@ export async function scrape({ page, query, model, firearmType }) {
       return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
     });
 
+  // ── Scrape detail pages sequentially for descriptions ────────────────
+  const pdpDataMap = {};
+  const PDP_LIMIT = 3;
+  const pdpTargets = relevant.slice(0, PDP_LIMIT);
+
+  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) sequentially for descriptions...`);
+
+  for (const listing of pdpTargets) {
+    const pdpUrl = listing.url;
+    try {
+      await delay(200);
+      try {
+        await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+      } catch {
+        // partial load
+      }
+
+      await page.waitForFunction(
+        () => (document.body.innerText || "").length > 100,
+        { timeout: 3000 }
+      ).catch(() => {});
+
+      const data = await page.evaluate(() => {
+        // GI page structure: a single div.row contains title, "Description:" text,
+        // then spec lines (Rifle Caliber:, Manufacturer:, etc.), then Price.
+        // There is NO #description element.
+        const specs = {};
+
+        // Find the content area — the innermost div containing spec labels
+        let contentText = "";
+        document.querySelectorAll("div.row, div.col-xs-12").forEach(el => {
+          const text = el.innerText || "";
+          if (/Rifle Caliber:|Pistol Caliber:|Shotgun Gauge:|Manufacturer:/i.test(text)) {
+            if (!contentText || text.length < contentText.length) {
+              contentText = text;
+            }
+          }
+        });
+        // Fallback: use body text
+        if (!contentText) contentText = document.body.innerText || "";
+
+        // Extract description: text between "Description:" and the first spec label
+        let description = "";
+        const descMatch = contentText.match(/Description:\s*([\s\S]*?)(?=(?:Rifle Caliber|Pistol Caliber|Shotgun Gauge|Manufacturer|Model|Barrel Length|Condition|Action|Stock|Chambers|Bore)\s*:|Price:|$)/i);
+        if (descMatch) {
+          description = descMatch[1].trim();
+        }
+
+        // Parse all label:value lines from the full content area
+        const SKIP_LABELS = /^(price|buy\s*now|see\s*all|email|send|contact|seller|phone|state|zip|country|member|categories|ffl|shipping|payment|your|message|back|privacy|user|faq|career|gun[s]?\s*international|browse|advanced|new\s*today|go|check\s*payment|layaway|return|active\s*listing|company|first\s*name|last\s*name|fax|website|address|city)/i;
+
+        // GI-specific label aliases
+        const LABEL_ALIASES = {
+          "rifle caliber": "caliber",
+          "pistol caliber": "caliber",
+          "shotgun gauge": "caliber",
+          "gauge": "caliber",
+          "manufacturer": "brand",
+          "barrels": "barrelLength",
+          "barrel length": "barrelLength",
+          "manufacture date": "yearManufactured",
+          "lop": "lengthOfPull",
+          "stock comb": "stockComb",
+          "bore condition": "boreCondition",
+          "metal condition": "metalCondition",
+          "wood condition": "woodCondition",
+          "fore end": "foreEnd",
+        };
+
+        const lines = contentText.split(/\n/);
+        for (const line of lines) {
+          const match = line.trim().match(/^([A-Za-z][A-Za-z\s/]{1,30}):\s*(.+)/);
+          if (match) {
+            const label = match[1].trim();
+            const value = match[2].trim();
+            if (label.length > 1 && value.length > 0 && value.length < 150 && !SKIP_LABELS.test(label)) {
+              const key = LABEL_ALIASES[label.toLowerCase()]
+                || label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
+              if (!specs[key]) specs[key] = value;
+            }
+          }
+        }
+
+        return { description, ...specs };
+      });
+
+      pdpDataMap[pdpUrl] = data;
+    } catch (e) {
+      console.warn(`[${sourceName}] PDP failed for ${pdpUrl.substring(pdpUrl.lastIndexOf('/')+1, pdpUrl.lastIndexOf('/')+30)}: ${e.message || e}`);
+    }
+  }
+
   // Build results — only keep listings that already have a price
   const results = [];
-  for (const l of relevant.slice(0, MAX_LISTINGS)) {
+  for (const l of pdpTargets) {
     const p = parseUsdPrice(l.price);
     if (p == null || p <= 0) continue;
+
+    const pdp = pdpDataMap[l.url] || {};
+    const rawCond = pdp.condition || l.condition || "Unknown";
+
     results.push({
       sourceName,
-      condition: l.condition || "Unknown",
       pageUrl: l.url,
       title: l.title || null,
-      description: l.description || "",
-      model: model || "",
+      description: (pdp.description || l.description || "").toLowerCase(),
+      ...pdp,
+      condition: normalizeCondition(rawCond),
+      model: pdp.model || model || "",
       price: { currency: "USD", original: p },
     });
   }
