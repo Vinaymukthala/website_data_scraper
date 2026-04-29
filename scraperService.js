@@ -34,6 +34,12 @@ import * as grabagun from "./scripts/providers/grabagun.js";
 //import * as gunscom from "./scripts/providers/gunscom.js";
 
 const PROVIDERS = [truegunvalue, gunsinternational, simpsonltd, collectorfirearms, budsgunshop, gunbroker, palmettostatearmory, grabagun];
+const PUPPETEER_PROVIDER_NAMES = new Set([
+  "truegunvalue",
+  "gunsinternational",
+  "simpsonltd",
+  "collectorfirearms",
+]);
 
 const PROVIDER_DEFAULT_CONDITIONS = {
   "gunbroker": "Used",
@@ -66,6 +72,8 @@ const BROWSER_ARGS = [
   "--disable-software-rasterizer",
 ];
 
+let browserPromise = null;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function withTimeout(promise, ms, label) {
@@ -78,6 +86,50 @@ function withTimeout(promise, ms, label) {
 
     promise.then(resolve, reject).finally(() => clearTimeout(timer));
   });
+}
+
+function getProviderTimeout(providerName, defaultTimeoutMs) {
+  const perProviderTimeouts = {
+    budsgunshop: Number(process.env.BUDSGUNSHOP_TIMEOUT_MS) || 25000,
+    gunbroker: Number(process.env.GUNBROKER_TIMEOUT_MS) || 40000,
+    palmettostatearmory: Number(process.env.PALMETTOSTATEARMORY_TIMEOUT_MS) || 25000,
+    grabagun: Number(process.env.GRABAGUN_TIMEOUT_MS) || 25000,
+    gunscom: Number(process.env.GUNSCOM_TIMEOUT_MS) || 25000,
+  };
+
+  return perProviderTimeouts[providerName] || defaultTimeoutMs;
+}
+
+function launchBrowser() {
+  return puppeteerExtra.launch({
+    headless: process.env.HEADLESS !== "false",
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH?.trim() || undefined,
+    pipe: true,
+    args: BROWSER_ARGS,
+    defaultViewport: { width: 1366, height: 768 },
+    ignoreDefaultArgs: ["--enable-automation"],
+  }).then((browser) => {
+    browser.once("disconnected", () => {
+      if (browserPromise) {
+        browserPromise = null;
+      }
+    });
+    return browser;
+  });
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = launchBrowser();
+  }
+
+  const browser = await browserPromise;
+  if (!browser.connected) {
+    browserPromise = launchBrowser();
+    return browserPromise;
+  }
+
+  return browser;
 }
 
 function normalizeRow(row, brand, caliber, model) {
@@ -204,102 +256,87 @@ async function scrapeFirearm(input) {
   const TYPE = String(input.firearmType).trim();
   const QUERY = [BRAND, MODEL, CALIBER].join(" ");
 
-  const headless = process.env.HEADLESS !== "false";
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH?.trim() || undefined;
   const timeoutMs = Number(process.env.SCRAPE_TIMEOUT_MS) || 45000;
 
   const startedAt = Date.now();
 
-  const browser = await puppeteerExtra.launch({
-    headless,
-    executablePath,
-    pipe: true,
-    args: BROWSER_ARGS,
-    defaultViewport: { width: 1366, height: 768 },
-    ignoreDefaultArgs: ["--enable-automation"],
-  });
+  const browser = await getBrowser();
 
   const errors = {};
   const allRows = [];
   const providerLatencies = [];
 
-  try {
-    const settled = await Promise.allSettled(
-      PROVIDERS.map(async (provider) => {
-        const page = await browser.newPage();
-        const startTime = Date.now();
+  const settled = await Promise.allSettled(
+    PROVIDERS.map(async (provider) => {
+      const needsPage = PUPPETEER_PROVIDER_NAMES.has(provider.sourceName);
+      const page = needsPage ? await browser.newPage() : null;
+      const startTime = Date.now();
 
-        try {
-          // ScraperAPI providers: cap at 8s (they typically respond in 2-4s)
-          // Puppeteer providers: cap at timeoutMs (5s from SCRAPE_TIMEOUT_MS env)
-          const SCRAPERAPI_PROVIDERS = new Set(["budsgunshop", "gunbroker", "palmettostatearmory", "grabagun", "gunscom"]);
-          const providerTimeout = SCRAPERAPI_PROVIDERS.has(provider.sourceName)
-            ? 25000
-            : timeoutMs;
+      try {
+        const providerTimeout = getProviderTimeout(provider.sourceName, timeoutMs);
 
-          const rows = await withTimeout(
-            provider.scrape({
-              page,
-              query: QUERY,
-              model: MODEL,
-              firearmType: TYPE,
-            }),
-            providerTimeout,
-            provider.sourceName
-          );
+        const rows = await withTimeout(
+          provider.scrape({
+            page,
+            query: QUERY,
+            model: MODEL,
+            firearmType: TYPE,
+          }),
+          providerTimeout,
+          provider.sourceName
+        );
 
-          return {
-            name: provider.sourceName,
-            rows: Array.isArray(rows) ? rows : [],
-            latencyMs: Date.now() - startTime
-          };
-        } catch (error) {
-          return {
-            name: provider.sourceName,
-            rows: [],
-            error,
-            latencyMs: Date.now() - startTime
-          };
-        } finally {
+        return {
+          name: provider.sourceName,
+          rows: Array.isArray(rows) ? rows : [],
+          latencyMs: Date.now() - startTime
+        };
+      } catch (error) {
+        return {
+          name: provider.sourceName,
+          rows: [],
+          error,
+          latencyMs: Date.now() - startTime
+        };
+      } finally {
+        if (page) {
           await page.close().catch(() => { });
         }
-      })
-    );
-
-    for (const result of settled) {
-      const value =
-        result.status === "fulfilled"
-          ? result.value
-          : { name: "unknown", rows: [], error: result.reason };
-
-      if (value.error) {
-        errors[value.name] = value.error?.message || String(value.error);
       }
+    })
+  );
 
-      if (!value.rows?.length && !value.error) {
-        errors[value.name] = "No results";
-      }
+  for (const result of settled) {
+    const value =
+      result.status === "fulfilled"
+        ? result.value
+        : { name: "unknown", rows: [], error: result.reason };
 
-      providerLatencies.push({ name: value.name, ms: value.latencyMs });
-
-      for (const row of value.rows || []) {
-        allRows.push(row);
-      }
+    if (value.error) {
+      errors[value.name] = value.error?.message || String(value.error);
     }
 
-    // Always log per-provider timing
-    if (providerLatencies.length > 0) {
-      console.log(`\n--- Per-Provider Timing ---`);
-      providerLatencies
-        .sort((a, b) => a.ms - b.ms)
-        .forEach(p => {
-          const status = errors[p.name] ? 'FAIL' : ' OK ';
-          console.log(`  [${status}] ${p.name.padEnd(22)} ${String(p.ms).padStart(6)}ms`);
-        });
-      console.log(`---------------------------`);
+    if (!value.rows?.length && !value.error) {
+      errors[value.name] = "No results";
     }
-  } finally {
-    await browser.close().catch(() => { });
+
+    providerLatencies.push({ name: value.name, ms: value.latencyMs });
+
+    for (const row of value.rows || []) {
+      allRows.push(row);
+    }
+  }
+
+  // Always log per-provider timing
+  if (providerLatencies.length > 0) {
+    console.log(`\n--- Per-Provider Timing ---`);
+    providerLatencies
+      .sort((a, b) => a.ms - b.ms)
+      .forEach(p => {
+        const status = errors[p.name] ? 'FAIL' : ' OK ';
+        console.log(`  [${status}] ${p.name.padEnd(22)} ${String(p.ms).padStart(6)}ms`);
+      });
+    console.log(`---------------------------`);
   }
 
   const keywords = extractKeywords(QUERY);

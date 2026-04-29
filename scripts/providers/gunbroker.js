@@ -16,20 +16,167 @@ import {
   extractKeywords,
   isRelevant,
   normalizeCondition,
-  extractSpecsFromHtml
+  extractSpecsFromHtml,
+  extractBrandAndCaliber
 } from "./_util.js";
 
 export const sourceName = "gunbroker";
 
 const MAX_LISTINGS = Number(process.env.GB_MAX_LISTINGS) || 10;
 const PDP_LIMIT = 3;
+const SEARCH_TIMEOUT_MS = Number(process.env.GB_SEARCH_TIMEOUT_MS) || 20_000;
+const PDP_TIMEOUT_MS = Number(process.env.GB_PDP_TIMEOUT_MS) || 15_000;
+const FIELD_BOUNDARY_RE = /\b(?:manufacturer|model|mfg model no|family|type|item group|action|caliber\/gauge|caliber|gauge|finish|finish type|stock\/grips|stock frame grips|barrel|barrel length|overall length|drilled \/ tapped|rate-?of-?twist|capacity|# of magazines|mag description|sights|sight type|optics\/sights|markings|serial|upc|weight|safety|frame|trigger|thread pattern|special feature|shipping|condition|country of origin|item condition)\s*:/i;
+const PLACEHOLDER_VALUE_RE = /^(other(?:\s+\w+){0,2}|n\/a|na|unknown|see description)$/i;
+const KNOWN_BRANDS = [
+  "COLT", "GLOCK", "SIG SAUER", "SIG", "SMITH & WESSON", "SMITH AND WESSON", "S&W",
+  "RUGER", "BERETTA", "CZ", "WALTHER", "SPRINGFIELD ARMORY", "SPRINGFIELD",
+  "TAURUS", "HECKLER & KOCH", "HECKLER AND KOCH", "H&K", "HK",
+  "BROWNING", "REMINGTON", "WINCHESTER", "SAVAGE", "MOSSBERG", "BENELLI",
+  "KIMBER", "HENRY", "DANIEL DEFENSE", "PALMETTO STATE ARMORY", "PSA"
+];
+
+function cleanFieldValue(rawValue) {
+  let value = String(rawValue || "").replace(/\s+/g, " ").trim();
+  if (!value) return "";
+
+  const boundaryMatch = value.slice(1).match(FIELD_BOUNDARY_RE);
+  if (boundaryMatch?.index != null) {
+    value = value.slice(0, boundaryMatch.index + 1).trim();
+  }
+
+  value = value
+    .replace(/\bclick here to view more auctions[\s\S]*$/i, "")
+    .replace(/\bhow this works[\s\S]*$/i, "")
+    .replace(/\ball items sold by[\s\S]*$/i, "")
+    .replace(/\bplease read prior to purchase[\s\S]*$/i, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  return value;
+}
+
+function truncateAtInlineMarkers(rawValue, markers) {
+  let value = String(rawValue || "").replace(/\s+/g, " ").trim();
+  if (!value) return "";
+
+  for (const marker of markers) {
+    const idx = value.search(marker);
+    if (idx > 0) {
+      value = value.slice(0, idx).trim();
+    }
+  }
+
+  return value;
+}
+
+function isPlaceholderValue(value) {
+  return PLACEHOLDER_VALUE_RE.test(String(value || "").trim());
+}
+
+function assignSpec(specs, key, rawValue, { overwrite = false } = {}) {
+  const value = cleanFieldValue(rawValue);
+  if (!value || isPlaceholderValue(value)) return;
+  if (!overwrite && specs[key]) return;
+  specs[key] = value;
+}
+
+function normalizeGunBrokerSpecs(specs, title) {
+  const normalized = {};
+
+  for (const [key, rawValue] of Object.entries(specs || {})) {
+    const value = cleanFieldValue(rawValue);
+    if (!value || isPlaceholderValue(value)) continue;
+    normalized[key] = value;
+  }
+
+  if (normalized.gauge && !normalized.caliber) {
+    normalized.caliber = normalized.gauge;
+  }
+
+  const extracted = extractBrandAndCaliber(title);
+  const upperTitle = String(title || "").toUpperCase();
+
+  if (!normalized.brand || isPlaceholderValue(normalized.brand)) {
+    normalized.brand = extracted.brand || "";
+  }
+
+  if (normalized.brand) {
+    const upperBrand = normalized.brand.toUpperCase();
+    const titleBrand = KNOWN_BRANDS.find((brand) => upperTitle.includes(brand));
+    if (titleBrand && upperBrand !== titleBrand && !upperTitle.includes(upperBrand)) {
+      normalized.brand = titleBrand;
+    }
+  }
+
+  if (!normalized.caliber || isPlaceholderValue(normalized.caliber)) {
+    normalized.caliber = extracted.caliber || "";
+  }
+
+  if (normalized.caliber && /caliber\/gauge|stock frame grips|sights|frame grip/i.test(normalized.caliber)) {
+    normalized.caliber = extracted.caliber || "";
+  }
+
+  if (normalized.gauge && /stock frame grips|sights|frame grip/i.test(normalized.gauge)) {
+    delete normalized.gauge;
+  }
+
+  const fieldSpecificTruncators = {
+    finish: [/\bFrame Material\b/i, /\bGrips\b/i, /\bModel Number\b/i],
+    finishType: [/\bFrame Material\b/i, /\bGrips\b/i, /\bModel Number\b/i],
+    frame: [/\bGrip\b/i, /\bGrips\b/i, /\bSights\b/i],
+    overallLength: [/\bModel Number\b/i, /\bCapacity\b/i, /\bSights\b/i],
+    twist: [/\bSights\b/i, /\bCapacity\b/i],
+    "rate-of-twist": [/\bSights\b/i, /\bCapacity\b/i],
+  };
+
+  for (const [key, markers] of Object.entries(fieldSpecificTruncators)) {
+    if (normalized[key]) {
+      normalized[key] = cleanFieldValue(truncateAtInlineMarkers(normalized[key], markers));
+    }
+  }
+
+  for (const key of Object.keys(normalized)) {
+    if (!normalized[key]) {
+      delete normalized[key];
+    }
+  }
+
+  return normalized;
+}
+
+function getScopedProductRoot($) {
+  const selectors = [
+    "[data-testid='item-detail-container']",
+    ".view-item-detail",
+    ".item-detail",
+    "main",
+    "#ContentPlaceHolder1_mainContent",
+  ];
+
+  for (const selector of selectors) {
+    const el = $(selector).first();
+    if (el.length) return el;
+  }
+
+  return $.root();
+}
 
 /**
  * Fetch HTML from a URL via ScraperAPI (plain — no render=true needed for GunBroker).
  */
 async function fetchViaScraperAPI(targetUrl, apiKey) {
   const apiUrl = `https://api.scraperapi.com?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
-  const response = await fetch(apiUrl, { signal: AbortSignal.timeout(30_000) });
+  const response = await fetch(apiUrl, { signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS) });
+  if (!response.ok) {
+    throw new Error(`ScraperAPI returned ${response.status}: ${response.statusText}`);
+  }
+  return await response.text();
+}
+
+async function fetchViaScraperAPIWithTimeout(targetUrl, apiKey, timeoutMs) {
+  const apiUrl = `https://api.scraperapi.com?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
+  const response = await fetch(apiUrl, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) {
     throw new Error(`ScraperAPI returned ${response.status}: ${response.statusText}`);
   }
@@ -40,8 +187,10 @@ async function fetchViaScraperAPI(targetUrl, apiKey) {
  * Fetch a single PDP page via ScraperAPI and extract description + condition.
  */
 async function fetchPdpData(pdpUrl, apiKey) {
+  const startedAt = Date.now();
   try {
-    const html = await fetchViaScraperAPI(pdpUrl, apiKey);
+    const html = await fetchViaScraperAPIWithTimeout(pdpUrl, apiKey, PDP_TIMEOUT_MS);
+    const fetchDurationMs = Date.now() - startedAt;
     const $ = cheerio.load(html);
 
     let description = "";
@@ -108,21 +257,23 @@ async function fetchPdpData(pdpUrl, apiKey) {
           };
           for (const [field, key] of Object.entries(fieldMap)) {
             const m = itemText.match(new RegExp(`${field}\\s*:\\s*"([^"]*)"`, "i"));
-            if (m && m[1].trim()) specs[key] = m[1].trim();
+            if (m) assignSpec(specs, key, m[1]);
           }
         }
       }
     });
 
-    // Strategy 2: DOM label/value pairs (span elements where label text is followed by value)
-    $("span, div, td, th").each((_, el) => {
+    // Strategy 2: DOM label/value pairs inside the product detail area only
+    const productRoot = getScopedProductRoot($);
+    productRoot.find("span, td, th, dt").each((_, el) => {
       const text = $(el).text().trim();
       if (/^(Manufacturer|Caliber|Model|Action|Barrel Length|Capacity|Gauge|Condition)$/i.test(text)) {
-        const value = $(el).next().text().trim();
+        const value = $(el).next("span, td, dd").text().trim()
+          || $(el).parent().find("td, dd").last().text().trim();
         if (value && value.length < 80) {
           const key = text.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
-          if (key === "manufacturer") { if (!specs.brand) specs.brand = value; }
-          else if (!specs[key]) specs[key] = value;
+          if (key === "manufacturer") assignSpec(specs, "brand", value);
+          else assignSpec(specs, key, value);
         }
       }
     });
@@ -176,20 +327,25 @@ async function fetchPdpData(pdpUrl, apiKey) {
           if (key === "rateOfTwist") key = "twist";
           if (key === "ofMagazines") key = "magazineCount";
 
-          if (!specs[key]) specs[key] = m[1].trim();
+          assignSpec(specs, key, m[1]);
         }
       }
     });
 
-    // Strategy 4: Fallback to generic extractSpecsFromHtml
-    const genericSpecs = extractSpecsFromHtml($);
+    // Strategy 4: Fallback to generic extraction scoped to the product area only
+    const genericSpecs = extractSpecsFromHtml($, productRoot);
     for (const [k, v] of Object.entries(genericSpecs)) {
-      if (v && !specs[k]) specs[k] = v;
+      assignSpec(specs, k, v);
     }
 
-    return { description, condition, ...specs };
+    const normalizedSpecs = normalizeGunBrokerSpecs(specs, description || $("title").text());
+
+    const totalDurationMs = Date.now() - startedAt;
+    console.log(`[${sourceName}] PDP timing ${pdpUrl.split("/").pop()}: fetch=${fetchDurationMs}ms total=${totalDurationMs}ms`);
+
+    return { description, condition, ...normalizedSpecs };
   } catch (e) {
-    console.warn(`[${sourceName}] PDP fetch failed: ${e.message}`);
+    console.warn(`[${sourceName}] PDP fetch failed after ${Date.now() - startedAt}ms: ${e.message}`);
     return { description: "", condition: "" };
   }
 }
@@ -210,10 +366,12 @@ export async function scrape({ page, query, model, firearmType }) {
   console.log(`[${sourceName}] ${searchUrl} (via ScraperAPI)`);
 
   let html;
+  const searchStartedAt = Date.now();
   try {
     html = await fetchViaScraperAPI(searchUrl, apiKey);
+    console.log(`[${sourceName}] Search fetch completed in ${Date.now() - searchStartedAt}ms.`);
   } catch (err) {
-    console.error(`[${sourceName}] ScraperAPI error: ${err.message}`);
+    console.error(`[${sourceName}] ScraperAPI error after ${Date.now() - searchStartedAt}ms: ${err.message}`);
     throw err;
   }
 
@@ -277,9 +435,11 @@ export async function scrape({ page, query, model, firearmType }) {
   const pdpTargets = relevant.slice(0, PDP_LIMIT);
   console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
 
+  const pdpBatchStartedAt = Date.now();
   const pdpResults = await Promise.all(
     pdpTargets.map(l => fetchPdpData(l.url, apiKey))
   );
+  console.log(`[${sourceName}] PDP batch completed in ${Date.now() - pdpBatchStartedAt}ms.`);
 
   // Build results
   const results = [];
@@ -289,8 +449,11 @@ export async function scrape({ page, query, model, firearmType }) {
     const p = parseUsdPrice(l.price);
     if (p == null || p <= 0) continue;
 
+    const normalizedPdp = normalizeGunBrokerSpecs(pdp, l.title);
+    const extracted = extractBrandAndCaliber(l.title);
+
     const upper = l.title.toUpperCase();
-    let rawCond = pdp.condition || "";
+    let rawCond = normalizedPdp.condition || "";
     if (!rawCond) {
       if (/\bNEW\b/.test(upper) && !/\bUSED\b/.test(upper)) rawCond = "New";
       else if (/\bNIB\b/.test(upper) || /\bNEW IN BOX\b/.test(upper)) rawCond = "New";
@@ -301,12 +464,12 @@ export async function scrape({ page, query, model, firearmType }) {
       sourceName,
       pageUrl: l.url,
       title: l.title.slice(0, 200) || null,
-      description: (pdp.description || "").toLowerCase(),
-      ...pdp,
+      description: (normalizedPdp.description || "").toLowerCase(),
+      ...normalizedPdp,
       condition: normalizeCondition(rawCond),
-      model: pdp.model || model || "",
-      caliber: pdp.caliber || "",
-      brand: pdp.brand || "",
+      model: normalizedPdp.model || model || "",
+      caliber: normalizedPdp.caliber || extracted.caliber || "",
+      brand: normalizedPdp.brand || extracted.brand || "",
       price: { currency: "USD", original: p },
     });
   }
