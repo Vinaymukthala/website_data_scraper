@@ -5,6 +5,7 @@
  *
  * Env:
  *   SCRAPER_API_KEY        (required) Your ScraperAPI key
+ *   SCRAPE_TIMEOUT_MS      ScraperAPI fetch timeout per request (default 15000)
  *   PSA_MAX_LISTINGS=10    Max products to return (default 10)
  */
 
@@ -15,7 +16,11 @@ import {
   extractKeywords,
   isRelevant,
   normalizeCondition,
-  extractSpecsFromHtml
+  extractSpecsFromHtml,
+  modelMatches,
+  CALIBER_MAP,
+  extractBreadcrumbTrailFrom$,
+  breadcrumbTrailImpliesNonFirearm,
 } from "./_util.js";
 
 export const sourceName = "palmettostatearmory";
@@ -28,7 +33,8 @@ const PDP_LIMIT = 3;
  */
 async function fetchViaScraperAPI(targetUrl, apiKey) {
   const apiUrl = `https://api.scraperapi.com?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
-  const response = await fetch(apiUrl, { signal: AbortSignal.timeout(30_000) });
+  const ms = Number(process.env.SCRAPE_TIMEOUT_MS) || 15000;
+  const response = await fetch(apiUrl, { signal: AbortSignal.timeout(ms) });
   if (!response.ok) {
     throw new Error(`ScraperAPI returned ${response.status}: ${response.statusText}`);
   }
@@ -118,17 +124,18 @@ async function fetchPdpData(pdpUrl, apiKey) {
     const condEl = $("[class*='condition']").first();
     if (condEl.length) condition = condEl.text().trim();
 
-    return { description, condition, ...specs };
+    const breadcrumbTrail = extractBreadcrumbTrailFrom$($);
+    return { description, condition, breadcrumbTrail, ...specs };
   } catch (e) {
     console.warn(`[${sourceName}] PDP fetch failed: ${e.message}`);
-    return { description: "", condition: "" };
+    return { description: "", condition: "", breadcrumbTrail: "" };
   }
 }
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, model, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "7260a6ebef2b9568767d0c2cb1c03515";
+  const apiKey = process.env.SCRAPER_API_KEY || "9c2b60714d381b52838ca7bb29ea0c58";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
@@ -178,28 +185,34 @@ export async function scrape({ page, query, model, firearmType }) {
   console.log(`[${sourceName}] Extracted ${raw.length} listing(s).`);
   if (raw.length === 0) return [];
 
-  // Filter accessories
-  let relevant = raw.filter(l => {
+  // Always SERP-filter (no "blind mode" for ≤3 hits — that let magazines, mounts, etc. through).
+  const relevant = raw.filter((l) => {
     const title = (l.title || "").toUpperCase();
     const upBrand = (query.split(" ")[0] || "").toUpperCase();
     const upModel = (model || "").toUpperCase();
 
-    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
-    const hasCaliber = calibers.some(c => title.includes(c));
+    const hasCaliber = CALIBER_MAP.some((entry) => entry.patterns.some((p) => p.test(title)));
     const hasBrand = title.includes(upBrand);
-    const hasModel = upModel ? title.includes(upModel) : true;
+    const hasModel = modelMatches(title, upModel);
 
     if (hasBrand && hasModel && hasCaliber) {
       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
+      if (
+        /\b(BARREL\s+SEAL|O[\s-]?RING|FOLLOWER|RECOIL\s+SPRING)\b/i.test(title) ||
+        /\b(10|25|50)[\s-]*PACK\b.*\bSEAL\b/i.test(title) ||
+        (/\bFITS\b/i.test(title) && /\b(SEAL|RING|FOLLOWER)\b/i.test(title))
+      ) {
+        return false;
+      }
       return true;
     }
 
-    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
+    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model, query);
   });
 
   console.log(`[${sourceName}] After site-specific filters: ${relevant.length} relevant listing(s).`);
 
-  // Fetch PDP data in parallel (3 max)
+  // Fetch PDP data in parallel (up to PDP_LIMIT)
   const pdpTargets = relevant.slice(0, PDP_LIMIT);
   console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
 
@@ -214,6 +227,25 @@ export async function scrape({ page, query, model, firearmType }) {
     const pdp = pdpResults[i] || {};
     const p = parseUsdPrice(l.price);
     if (p == null || p <= 0) continue;
+
+    if (breadcrumbTrailImpliesNonFirearm(pdp.breadcrumbTrail)) {
+      console.log(`[${sourceName}] Post-PDP rejected (breadcrumb): ${String(pdp.breadcrumbTrail).slice(0, 140)}`);
+      continue;
+    }
+
+    const blob = [
+      l.title,
+      pdp.description || "",
+      pdp.brand || "",
+      pdp.model || "",
+      pdp.caliber || "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    if (isAccessory(blob)) {
+      console.log(`[${sourceName}] Post-PDP rejected (accessory): ${l.title}`);
+      continue;
+    }
 
     const upper = l.title.toUpperCase();
     let rawCond = pdp.condition || "";

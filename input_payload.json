@@ -2,9 +2,9 @@
   "quickQuoteRequest": {
     "firearm": {
       "firearmType": "SHOTGUN",
-      "brand": "Benelli",
-      "model": "M4",
-      "caliber": "12 GA"
+      "brand": "Winchester",
+      "model": "Model 12",
+      "caliber": "12 Gauge"
     }
   }
 }

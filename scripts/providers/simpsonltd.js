@@ -1,207 +1,36 @@
 /**
- * SimpsonLtd.com scraper.
+ * SimpsonLtd.com scraper — API-based.
+ *
+ * SimpsonLtd migrated to a React SPA (Firebase + Typesense).
+ * Their search results are powered by a public Cloud Function:
+ *   https://us-central1-simpsonltd-bfd2b.cloudfunctions.net/searchInventoryTypesense_v2
+ *
+ * This provider calls that API directly (no Puppeteer needed),
+ * which is faster and more reliable than scraping the DOM.
  *
  * Flow:
- *   1. Navigate to /search?query=QUERY
- *   2. Collect product listing links (a.list-item-link)
- *   3. Filter out accessories + relevance filter
- *   4. Extract prices from listing page or visit detail pages
- *   5. Return normalised result array
+ *   1. Call Typesense search API with the query
+ *   2. Filter by License (FFL/C&R = firearm, NLR = accessory)
+ *   3. Apply caliber/model relevance checks
+ *   4. Return normalised result array
  *
  * Env:
  *   SL_MAX_LISTINGS=10    Max products to return (default 10)
- *   SL_DETAIL_DELAY=200   ms between detail page requests (default 200)
  */
 
-import { setTimeout as delay } from "node:timers/promises";
-import { 
-  conditionFromText, 
-  ensureNotBlocked, 
-  parseUsdPrice, 
-  toAbsoluteUrl,
-  isAccessory,
-  extractKeywords,
+import {
+  parseUsdPrice,
   isRelevant,
-  normalizeCondition
+  extractKeywords,
+  normalizeCondition,
 } from "./_util.js";
 
 export const sourceName = "simpsonltd";
 
-const BASE_URL = "https://www.simpsonltd.com/";
+const SEARCH_API =
+  "https://us-central1-simpsonltd-bfd2b.cloudfunctions.net/searchInventoryTypesense_v2";
+const BASE_URL = "https://www.simpsonltd.com";
 const MAX_LISTINGS = Number(process.env.SL_MAX_LISTINGS) || 10;
-const DETAIL_DELAY_MS = Number(process.env.SL_DETAIL_DELAY) || 200;
-
-// ---------------------------------------------------------------------------
-// Clean up raw title from listing cards
-// ---------------------------------------------------------------------------
-function cleanTitle(rawTitle) {
-  if (!rawTitle) return "";
-  let t = rawTitle;
-  const dollarIdx = t.indexOf("$");
-  if (dollarIdx > 0) t = t.slice(0, dollarIdx);
-  t = t.replace(/^[A-Z]\d{4,7}\s+/, "");
-  t = t.replace(/Cal:\s*[^\s]+/gi, "");
-  t = t.replace(/Blue:\s*[^\s]+/gi, "");
-  t = t.replace(/Bore:\s*[^\s]+/gi, "");
-  t = t.replace(/Barrel:\s*[^\s]+/gi, "");
-  t = t.replace(/\s{2,}/g, " ").trim();
-  return t;
-}
-
-// ---------------------------------------------------------------------------
-// Step 1: Navigate to search
-// ---------------------------------------------------------------------------
-async function navigateSearch(page, query) {
-  const searchUrl = new URL("/search", BASE_URL);
-  searchUrl.searchParams.set("query", query);
-  console.log(`[${sourceName}] Searching: ${searchUrl.href}`);
-  await page.goto(searchUrl.href, { waitUntil: "domcontentloaded", timeout: 10_000 });
-  await ensureNotBlocked(page, `${sourceName}: after navigation`);
-}
-
-// ---------------------------------------------------------------------------
-// Step 2: Collect listing URLs
-// ---------------------------------------------------------------------------
-async function collectListingUrls(page) {
-  await page.waitForFunction(
-    () => {
-      const cards = document.querySelectorAll("a.list-item-link, .search-results a[href*='/products/']");
-      const noResults = /no results|nothing found|0 results/i.test(
-        (document.body?.innerText || "").slice(0, 3000)
-      );
-      return cards.length > 0 || noResults;
-    },
-    { timeout: 5_000, polling: 250 }
-  ).catch(() => {});
-
-  await delay(100);
-
-  const listings = await page.evaluate((baseUrl) => {
-    const seen = new Set();
-    const out = [];
-
-    let cards = Array.from(document.querySelectorAll("a.list-item-link"));
-    if (cards.length === 0) {
-      cards = Array.from(document.querySelectorAll("a[href*='/products/']"));
-    }
-
-    for (const a of cards) {
-      let href;
-      try { href = new URL(a.getAttribute("href") || a.href, baseUrl).href; }
-      catch { continue; }
-
-      if (!href.includes("/products/")) continue;
-      if (seen.has(href)) continue;
-      seen.add(href);
-
-      const rawTitle = (a.textContent || "").trim().slice(0, 400);
-
-      const priceText = (
-        a.querySelector("p.search-item-price > span, span.search-item-price, .price span, .price")
-          ?.textContent || ""
-      ).trim();
-
-      const specs = {};
-      const specSpans = a.querySelectorAll("span");
-      for (const s of specSpans) {
-        const t = (s.textContent || "").trim();
-        const calM = t.match(/^Cal:\s*(.+)/i);
-        const blueM = t.match(/^Blue:\s*(.+)/i);
-        const boreM = t.match(/^Bore:\s*(.+)/i);
-        const barrelM = t.match(/^Barrel:\s*(.+)/i);
-        const stockM = t.match(/^Stock:\s*(.+)/i);
-        if (calM) specs.caliber = calM[1].trim();
-        if (blueM) specs.blue = blueM[1].trim();
-        if (boreM) specs.bore = boreM[1].trim();
-        if (barrelM) specs.barrel = barrelM[1].trim();
-        if (stockM) specs.stock = stockM[1].trim();
-      }
-
-      out.push({ href, rawTitle, priceText, specs });
-    }
-
-    return out;
-  }, BASE_URL);
-
-  console.log(`[${sourceName}] Found ${listings.length} listing(s) on search results page.`);
-  return listings;
-}
-
-// ---------------------------------------------------------------------------
-// Step 3: Scrape a single detail page
-// ---------------------------------------------------------------------------
-async function scrapeDetailPage(page, href) {
-  await page.goto(href, { waitUntil: "domcontentloaded", timeout: 10_000 });
-  await ensureNotBlocked(page, `${sourceName}: detail page`);
-  const data = await page.evaluate((pageUrl) => {
-    const h1 = document.querySelector("h1");
-    const title = (h1?.innerText || h1?.textContent || document.title || "").trim();
-
-    let sku = "";
-    const h3s = document.querySelectorAll("h3");
-    for (const h of h3s) {
-      const t = (h.innerText || h.textContent || "").trim();
-      const m = t.match(/SKU:\s*(\S+)/i);
-      if (m) { sku = m[1]; break; }
-    }
-
-    const mainArea =
-      document.querySelector("main, #main, .product-detail, .product-page, article") ||
-      document.body;
-    const bodyText = (mainArea?.innerText || document.body?.innerText || "").trim();
-
-    let priceText = "";
-    const priceEl = document.querySelector(".product-price, [class*='price'], #price, .price");
-    if (priceEl) {
-      const t = (priceEl.innerText || priceEl.textContent || "").trim();
-      if (/\$[\d,]+/.test(t)) priceText = t;
-    }
-
-    if (!priceText) {
-      const allEls = mainArea.querySelectorAll("span, div, p, td, strong, b");
-      for (const el of allEls) {
-        const t = (el.innerText || el.textContent || "").trim();
-        if (/^\$[\d,]+\.?\d*$/.test(t)) { priceText = t; break; }
-      }
-    }
-
-    if (!priceText) {
-      const m = bodyText.match(/\$\s*([\d,]+\.?\d*)/);
-      if (m) priceText = "$" + m[1];
-    }
-
-    // Extract ALL label:value specs from body text
-    const specs = {};
-    const SKIP_LABELS = /^(price|shipping|sku|call|email|contact|simpson|privacy|address|phone)/i;
-    const lines = bodyText.split(/\n/);
-    for (const line of lines) {
-      const match = line.trim().match(/^([A-Za-z][A-Za-z\s/]{1,25}):\s*(.+)/);
-      if (match) {
-        const label = match[1].trim();
-        const value = match[2].trim();
-        if (label.length > 1 && value.length > 0 && value.length < 150 && !SKIP_LABELS.test(label)) {
-          let key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
-          // Normalize aliases
-          if (key === "cal") key = "caliber";
-          if (!specs[key]) specs[key] = value;
-        }
-      }
-    }
-
-    const conditionParts = [];
-    if (specs.stock) conditionParts.push(specs.stock);
-    
-    if (conditionParts.length === 0) {
-      if (specs.blue)   conditionParts.push(`Blue: ${specs.blue}`);
-      if (specs.bore)   conditionParts.push(`Bore: ${specs.bore}`);
-    }
-    const condition = conditionParts.join(", ") || "Unknown";
-
-    return { title, priceText, condition, description: "", pageUrl, ...specs };
-  }, href);
-
-  return data;
-}
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -209,127 +38,100 @@ async function scrapeDetailPage(page, href) {
 export async function scrape({ page, query, model, firearmType }) {
   const keywords = extractKeywords(query);
 
-  await navigateSearch(page, query);
+  // Build the API URL
+  const apiUrl = new URL(SEARCH_API);
+  apiUrl.searchParams.set("query", query);
+  apiUrl.searchParams.set("itemsPerPage", String(MAX_LISTINGS));
+  apiUrl.searchParams.set("currentPage", "1");
+  apiUrl.searchParams.set("sold", "false");
 
-  let listings = await collectListingUrls(page);
+  console.log(`[${sourceName}] Searching: ${apiUrl.href}`);
 
-  if (listings.length === 0) {
-    console.warn(`[${sourceName}] No listings found for query: "${query}".`);
-    const simpleQuery = query.split(" ")[0];
-    if (simpleQuery !== query) {
-      console.log(`[${sourceName}] Retrying with simpler query: "${simpleQuery}"`);
-      await navigateSearch(page, simpleQuery);
-      const fallbackListings = await collectListingUrls(page);
-      if (fallbackListings.length === 0) {
-        console.warn(`[${sourceName}] Still no results. Returning empty.`);
-        return [];
-      }
-      listings.push(...fallbackListings);
-    } else {
-      return [];
-    }
-  }
-
-  // ── Filter out accessories ─────────────────────────────────────────
-  const searchedCaliber = (query.match(/\d+\s*(?:mm|ga|gauge|lr|acp|mag|rem|win|spl|s&w|bmg)/i) || [""])[0].toUpperCase();
-
-  const relevant = listings.filter(l => {
-    const title = (l.rawTitle || "").toUpperCase();
-    const upBrand = (query.split(" ")[0] || "").toUpperCase();
-    const upModel = (model || "").toUpperCase();
-    
-    // Check caliber in BOTH title AND listing-page specs
-    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62", "12 GA", "20 GA", ".22 LR"];
-    const specCaliber = (l.specs?.caliber || "").toUpperCase();
-    const hasCaliber = calibers.some(c => title.includes(c) || specCaliber.includes(c));
-    // Also match if listing caliber contains the searched caliber
-    const caliberMatch = hasCaliber || (searchedCaliber && specCaliber.includes(searchedCaliber));
-    
-    const hasBrand = title.includes(upBrand);
-    const hasModel = upModel ? title.includes(upModel) : true;
-
-    if (hasBrand && hasModel && caliberMatch) {
-       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
-       return true;
-    }
-
-    return !isAccessory(l.rawTitle) && isRelevant(l.rawTitle, keywords, sourceName, model);
-  });
-
-  const PDP_LIMIT = 3;
-  const pdpTargets = relevant.slice(0, PDP_LIMIT);
-
-  if (pdpTargets.length === 0) {
-    console.warn(`[${sourceName}] No firearm listings found after filtering.`);
+  let data;
+  try {
+    const res = await fetch(apiUrl.href, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    console.warn(`[${sourceName}] API request failed: ${err.message}`);
     return [];
   }
 
-  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
+  const hits = data?.hits || [];
+  console.log(`[${sourceName}] API returned ${hits.length} hit(s) (total: ${data?.nbHits || 0}).`);
+
+  if (hits.length === 0) return [];
+
   const results = [];
-  const browser = page.browser();
 
-  const pdpResults = await Promise.allSettled(pdpTargets.map(async (listing) => {
-    const pageUrl = toAbsoluteUrl(BASE_URL, listing.href);
-    if (!pageUrl) return null;
-
-    let pdpPage;
-    try {
-      pdpPage = await browser.newPage();
-      const data = await scrapeDetailPage(pdpPage, pageUrl);
-
-      const finalTitle = data.title || cleanTitle(listing.rawTitle) || "";
-      if (isAccessory(finalTitle)) {
-        console.log(`[${sourceName}]   → Accessory: "${finalTitle}" — skipping.`);
-        return null;
-      }
-
-      const price = parseUsdPrice(data.priceText || listing.priceText);
-      if (price == null || price <= 0) {
-        console.log(`[${sourceName}]   → No valid price — skipping.`);
-        return null;
-      }
-
-      // Extract description from PDP page text
-      let description = data.description || "";
-      if (!description) {
-        try {
-          description = await pdpPage.evaluate(() => {
-            const mainArea = document.querySelector("main, #main, .product-detail, .product-page, article") || document.body;
-            const ps = Array.from(mainArea.querySelectorAll("p"))
-              .map(p => (p.innerText || p.textContent || "").trim())
-              .filter(t => t.length > 50 && !t.includes("Simpson Limited") && !t.includes("Privacy Policy") && !t.includes("Call us at"));
-            if (ps.length > 0) return ps.sort((a, b) => b.length - a.length)[0];
-            return "";
-          });
-        } catch { description = ""; }
-      }
-
-      console.log(`[${sourceName}]   → "${data.title}" — $${price}`);
-
-      return {
-        sourceName,
-        pageUrl,
-        title: finalTitle || null,
-        description: (description || "").toLowerCase().replace(/\s+/g, " "),
-        ...data,
-        ...listing.specs,
-        condition: normalizeCondition(data.condition),
-        model: data.model || model || "",
-        price: { currency: "USD", original: price },
-      };
-    } catch (err) {
-      console.warn(`[${sourceName}]   → Error: ${err?.message}`);
-      return null;
-    } finally {
-      if (pdpPage) await pdpPage.close().catch(() => {});
+  for (const hit of hits) {
+    // 1. License-based firearm validation
+    const license = (hit.License || "").toUpperCase().trim();
+    if (!license || license === "NLR") {
+      console.log(`[${sourceName}]   → Skipped "${hit.Title}" — License: ${license || "none"} (not a firearm).`);
+      continue;
     }
-  }));
 
-  for (const r of pdpResults) {
-    if (r.status === "fulfilled" && r.value) {
-      results.push(r.value);
+    // 2. Relevance check (caliber conflict, model match, accessory filter)
+    const title = hit.Title || "";
+    if (!isRelevant(title, keywords, sourceName, model, query)) {
+      console.log(`[${sourceName}]   → Skipped "${title}" — not relevant.`);
+      continue;
     }
+
+    // 3. Price
+    const price = hit.PriceReduced && hit.ReducedPrice > 0
+      ? hit.ReducedPrice
+      : hit.OriginalPrice || hit.Wants || 0;
+    if (price <= 0) continue;
+
+    // 4. Condition from Blue/Bore/Stock fields
+    const condParts = [];
+    if (hit.Stock) condParts.push(`Stock: ${hit.Stock}`);
+    if (hit.Blue) condParts.push(`Blue: ${hit.Blue}`);
+    if (hit.Bore) condParts.push(`Bore: ${hit.Bore}`);
+    const condition = normalizeCondition(condParts.join(", ") || "Unknown");
+
+    // 5. Product URL — Simpson uses SKU-based URLs (e.g. /products/C42077)
+    const sku = hit.SKU || hit.objectID || "";
+    const pageUrl = `${BASE_URL}/products/${sku}`;
+
+    // 6. Description
+    const description = (hit.Description || "").trim().toLowerCase().replace(/\s+/g, " ");
+
+    // 7. Attributes
+    const attributes = {};
+    if (hit.Caliber) attributes.caliber = hit.Caliber;
+    if (hit.Barrel) attributes.barrelLength = hit.Barrel;
+    if (hit.Blue) attributes.blue = hit.Blue;
+    if (hit.Bore) attributes.bore = hit.Bore;
+    if (hit.Stock) attributes.stock = hit.Stock;
+    if (hit.Action) attributes.action = hit.Action;
+    if (hit.Category) attributes.category = hit.Category;
+    if (hit.Subcategory) attributes.subcategory = hit.Subcategory;
+    if (license) attributes.license = license;
+
+    console.log(`[${sourceName}]   → "${title}" — $${price}`);
+
+    results.push({
+      sourceName,
+      pageUrl,
+      title,
+      brand: hit.SubcategoryType || "",
+      model: model || "",
+      caliber: hit.Caliber || "",
+      condition,
+      description,
+      price: { currency: "USD", original: price },
+      attributes,
+    });
   }
+
   console.log(`[${sourceName}] Done — ${results.length} result(s).`);
   return results;
 }

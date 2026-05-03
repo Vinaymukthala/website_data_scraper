@@ -15,7 +15,9 @@ import {
   isAccessory, 
   extractKeywords, 
   isRelevant,
-  normalizeCondition 
+  normalizeCondition,
+  modelMatches,
+  CALIBER_MAP
 } from "./_util.js";
 
 export const sourceName = "gunsinternational";
@@ -26,7 +28,7 @@ const SEARCH_CATEGORY = { HANDGUN: "Pistols", RIFLE: "Rifles", SHOTGUN: "Shotgun
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
-export async function scrape({ page, query, model, firearmType }) {
+export async function scrape({ page, query, model, firearmType, caliber }) {
   const type = String(firearmType || "").trim().toUpperCase();
   const cat = SEARCH_CATEGORY[type] || "";
   const keywords = extractKeywords(query);
@@ -169,29 +171,37 @@ export async function scrape({ page, query, model, firearmType }) {
   // Filter: accessories, relevance, nav links
   const NAV_RE = /new-guns-for-sale-today|recently-sold|gun-of-the-month|featured-guns|gun-shows|gun-dealers|\.catt\.cfm|search\.cfm$|search-results\.cfm$/i;
 
-  const relevant = raw
-    .filter(l => !NAV_RE.test(l.url))
-    .filter(l => {
-      const title = (l.title || "").toUpperCase();
-      const upBrand = (query.split(" ")[0] || "").toUpperCase();
-      const upModel = (model || "").toUpperCase();
-      
-      const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
-      const hasCaliber = calibers.some(c => title.includes(c));
-      const hasBrand = title.includes(upBrand);
-      const hasModel = upModel ? title.includes(upModel) : true;
-
-      if (hasBrand && hasModel && hasCaliber) {
-         if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
-         return true;
-      }
-
-      return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
-    });
-
-  // ── Scrape detail pages sequentially for descriptions ────────────────
-  const pdpDataMap = {};
+  // If 3 or fewer listings, skip filtering — blindly open all PDPs
   const PDP_LIMIT = 3;
+  const blindMode = raw.filter(l => !NAV_RE.test(l.url)).length <= PDP_LIMIT;
+  let relevant;
+
+  if (blindMode) {
+    console.log(`[${sourceName}] ≤3 listings found — skipping filters, fetching all PDPs blindly.`);
+    relevant = raw.filter(l => !NAV_RE.test(l.url));
+  } else {
+    relevant = raw
+      .filter(l => !NAV_RE.test(l.url))
+      .filter(l => {
+        const title = (l.title || "").toUpperCase();
+        const upBrand = (query.split(" ")[0] || "").toUpperCase();
+        const upModel = (model || "").toUpperCase();
+        
+        const hasCaliber = CALIBER_MAP.some(entry => entry.patterns.some(p => p.test(title)));
+        const hasBrand = title.includes(upBrand);
+        const hasModel = modelMatches(title, upModel);
+
+        if (hasBrand && hasModel && hasCaliber) {
+           if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
+           return isRelevant(l.title, keywords, sourceName, model, query);
+        }
+
+        return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model, query);
+      });
+  }
+
+  // ── Scrape detail pages sequentially for descriptions ────────────────────
+  const pdpDataMap = {};
   const pdpTargets = relevant.slice(0, PDP_LIMIT);
 
   console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
@@ -285,6 +295,13 @@ export async function scrape({ page, query, model, firearmType }) {
     if (p == null || p <= 0) continue;
 
     const pdp = pdpDataMap[l.url] || {};
+
+    // Post-PDP accessory check: if we were in blind mode, validate now
+    if (blindMode && isAccessory(l.title)) {
+      console.log(`[${sourceName}] Post-PDP rejected (accessory): ${l.title}`);
+      continue;
+    }
+
     const rawCond = pdp.condition || l.condition || "Unknown";
 
     results.push({

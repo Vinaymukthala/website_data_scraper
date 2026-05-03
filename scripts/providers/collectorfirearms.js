@@ -1,107 +1,86 @@
 /**
  * CollectorsFirearms.com scraper.
  *
- * WooCommerce-based site — search via /?s= query parameter.
- * Extracts listings from search results page cards.
- * Condition is inferred from the title (e.g. "NEW") and description text.
- *
- * Env:
- *   CF_MAX_LISTINGS=10   Max products to return (default 10)
+ * Simple approach:
+ *   1. Search via /?s= query
+ *   2. Match listing titles against LLM-normalized brand + model
+ *   3. Return max 3 matching results
+ *   4. Condition: "NEW" in title → New, else scan description for grade
  */
 
-import { 
-  parseUsdPrice, 
-  conditionFromText, 
-  isAccessory, 
-  extractKeywords, 
-  isRelevant,
-  normalizeCondition
-} from "./_util.js";
+import { parseUsdPrice, isRelevant, extractKeywords } from "./_util.js";
 
 export const sourceName = "collectorfirearms";
 
 const BASE_URL = "https://collectorsfirearms.com/";
-const MAX_LISTINGS = Number(process.env.CF_MAX_LISTINGS) || 10;
+const MAX_RESULTS = 3;
 
 /**
- * Clean up the raw title from the search card.
- * Removes leading SKU codes like "(SN: CHED655)" and trailing item IDs like "(L2026-04730)"
+ * Condition logic:
+ * - "NEW" in title → "New"
+ * - Otherwise scan description for: Excellent, Very Good, Good, Fair
+ * - Default: "Used"
  */
-function cleanTitle(rawTitle) {
-  let t = String(rawTitle || "").replace(/\s+/g, " ").trim();
-  // Remove serial number prefix: "(SN: CHED655)"
-  t = t.replace(/^\(SN:\s*[^)]+\)\s*/i, "");
-  // Remove item ID suffix: "(L2026-04730)"
-  t = t.replace(/\s*\(L\d{4}-\d{4,6}\)\s*/gi, "");
-  // Trim trailing "NEW" / "USED" condition tag (we extract it separately)
-  // Handles both "PISTOL 9MM NEW" and "PISTOL 9MMNEW" (no space)
-  t = t.replace(/(NEW|USED)\s*$/i, "");
-  return t.trim();
+function extractCondition(title, description) {
+  const upTitle = (title || "").toUpperCase();
+  if (/\bNEW\b/.test(upTitle)) return "New";
+
+  const upDesc = (description || "").toUpperCase();
+  if (/\bEXCELLENT\b/.test(upDesc)) return "Excellent";
+  if (/\bVERY\s+GOOD\b/.test(upDesc)) return "Very Good";
+  if (/\bGOOD\b/.test(upDesc) && !/\bVERY\s+GOOD\b/.test(upDesc)) return "Good";
+  if (/\bFAIR\b/.test(upDesc)) return "Fair";
+  return "Used";
 }
 
 /**
- * Extract condition from the title text. 
- * CollectorsFirearms often appends "NEW" or mentions condition in the description.
+ * Clean up raw title — remove serial numbers and item IDs.
  */
-function extractCondition(title, description) {
-  const combined = `${title} ${description}`.toUpperCase();
-  if (/\bNEW\b/.test(combined) && !/\bUSED\b/.test(combined)) return "New";
-  if (/\bUSED\b/.test(combined)) return "Used";
-  if (/\bEXCELLENT\b/.test(combined)) return "Used";
-  if (/\bVERY GOOD\b/.test(combined)) return "Used";
-  if (/\bGOOD\b/.test(combined)) return "Used";
-  if (/\bFAIR\b/.test(combined)) return "Used";
-  return conditionFromText(combined);
+function cleanTitle(rawTitle) {
+  let t = String(rawTitle || "").replace(/\s+/g, " ").trim();
+  t = t.replace(/^\(SN:\s*[^)]+\)\s*/i, "");
+  t = t.replace(/\s*\(L\d{4}-\d{4,6}\)\s*/gi, "");
+  return t.trim();
 }
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
-export async function scrape({ page, query, model, firearmType }) {
-  const keywords = extractKeywords(query);
-  const minMatch = Math.min(2, keywords.length);
-
-  // Build search URL
+export async function scrape({ page, query, brand, model, caliber, firearmType }) {
   const url = new URL("/", BASE_URL);
   url.searchParams.set("s", query);
 
   console.log(`[${sourceName}] ${url.href}`);
 
-  // ── Block heavy assets to speed up page load ──────────────────────
+  // Block heavy assets
   await page.setRequestInterception(true);
-  const BLOCKED_TYPES = new Set(["image", "stylesheet", "font", "media", "texttrack", "eventsource"]);
-  const BLOCKED_DOMAINS = /google-analytics|googletagmanager|facebook|doubleclick|hotjar|pinterest|tiktok|bing\.com\/bat|clarity\.ms/i;
-
   page.on("request", (req) => {
-    if (BLOCKED_TYPES.has(req.resourceType()) || BLOCKED_DOMAINS.test(req.url())) {
+    const type = req.resourceType();
+    if (["image", "stylesheet", "font", "media"].includes(type)) {
       req.abort();
     } else {
       req.continue();
     }
   });
 
-  // Navigate — WooCommerce search is server-rendered HTML
   await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: 10_000 });
 
-  // Quick wait — product cards are in the initial HTML, no need to wait long
   await page.waitForFunction(
-    () => document.querySelectorAll("article, .product, .post, a[href*='/product/']").length > 0
+    () => document.querySelectorAll("article, .product, a[href*='/product/']").length > 0
       || /no results|nothing found|no products/i.test(
         (document.body?.innerText || "").slice(0, 3000)),
     { timeout: 4000, polling: 150 }
   ).catch(() => {});
 
-  // Extract listings from the search results page
+  // Extract all listings from search page
   const raw = await page.evaluate((base) => {
     const out = [];
     const seen = new Set();
 
-    // WooCommerce search results — articles or product divs
     const cards = document.querySelectorAll(
       "article.product, li.product, div.product, article.post, .post-item"
     );
 
     for (const card of cards) {
-      // Find the title link
       const titleLink = card.querySelector(
         ".woocommerce-loop-product__title a, .product-title a, h2 a, h3 a, .entry-title a, a[href*='/product/']"
       );
@@ -116,17 +95,14 @@ export async function scrape({ page, query, model, firearmType }) {
       const title = (titleLink.textContent || "").trim();
       if (title.length < 5) continue;
 
-      // Find price
       let priceText = "";
       const priceEl = card.querySelector(".price, .amount, [class*='price']");
       if (priceEl) {
         priceText = (priceEl.textContent || "").trim();
-        // WooCommerce sometimes shows sale prices as "$800 $700" — take the last one
         const prices = priceText.match(/\$[\d,]+\.?\d*/g);
         if (prices && prices.length > 1) priceText = prices[prices.length - 1];
       }
 
-      // Find description
       const descEl = card.querySelector(
         ".woocommerce-product-details__short-description, .product-short-description, .entry-summary, .entry-content, p"
       );
@@ -135,7 +111,7 @@ export async function scrape({ page, query, model, firearmType }) {
       out.push({ url: href, title, price: priceText, description });
     }
 
-    // Fallback: if WooCommerce product cards aren't found, try generic links
+    // Fallback: generic product links
     if (out.length === 0) {
       for (const a of document.querySelectorAll("a[href*='/product/']")) {
         let href;
@@ -165,139 +141,81 @@ export async function scrape({ page, query, model, firearmType }) {
   console.log(`[${sourceName}] Extracted ${raw.length} listing(s).`);
   if (raw.length === 0) return [];
 
-  let relevant = raw.filter(l => {
-    const title = (l.title || "").toUpperCase();
-    const upBrand = (query.split(" ")[0] || "").toUpperCase();
-    const upModel = (model || "").toUpperCase();
+  const upBrand = (brand || "").toUpperCase();
+  const upModel = (model || "").toUpperCase();
+  const keywords = extractKeywords(query);
+
+  const matched = raw.filter(l => {
+    const upTitle = (l.title || "").toUpperCase();
+    if (upBrand && !upTitle.includes(upBrand)) return false;
+    if (upModel && !upModel.split(" ").every(w => upTitle.includes(w))) return false;
     
-    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
-    const hasCaliber = calibers.some(c => title.includes(c));
-    const hasBrand = title.includes(upBrand);
-    const hasModel = upModel ? title.includes(upModel) : true;
-
-    if (hasBrand && hasModel && hasCaliber) {
-       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
-       return true;
+    // Reuse universal relevance filter for caliber/gauge logic
+    if (!isRelevant(l.title, keywords, sourceName, model, query)) {
+      return false;
     }
-
-    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
+    
+    return true;
   });
 
-  // ── Scrape detail pages in parallel for descriptions ────────────────
-  const PDP_LIMIT = 3;
-  const pdpTargets = relevant.slice(0, PDP_LIMIT);
+  console.log(`[${sourceName}] Matched ${matched.length} listing(s) for "${brand} ${model}".`);
 
-  console.log(`[${sourceName}] Fetching ${pdpTargets.length} PDP(s) in parallel...`);
-
+  // Build results — max 3
+  const matchedTargets = matched.slice(0, MAX_RESULTS);
   const browser = page.browser();
   const pdpDataMap = {};
 
-  await Promise.all(pdpTargets.map(async (listing) => {
-    const pdpUrl = listing.url;
-    let pdpPage;
-    try {
-      pdpPage = await browser.newPage();
+  if (matchedTargets.length > 0) {
+    console.log(`[${sourceName}] Fetching ${matchedTargets.length} PDP(s) for full descriptions...`);
+    await Promise.all(matchedTargets.map(async (l) => {
+      let pdpPage;
       try {
-        await pdpPage.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-      } catch {
-        // partial load
+        pdpPage = await browser.newPage();
+        // disable assets for speed
+        await pdpPage.setRequestInterception(true);
+        pdpPage.on("request", (req) => {
+          if (["image", "stylesheet", "font", "media"].includes(req.resourceType())) req.abort();
+          else req.continue();
+        });
+
+        await pdpPage.goto(l.url, { waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
+        
+        const fullDesc = await pdpPage.evaluate(() => {
+          const el = document.querySelector(".single-product-description, #tab-description, .woocommerce-Tabs-panel--description, .product-description");
+          if (el) return el.textContent;
+          const backup = document.querySelector(".summary, .entry-summary");
+          return backup ? backup.textContent : "";
+        });
+
+        if (fullDesc) {
+          pdpDataMap[l.url] = fullDesc.replace(/\b(SKU|Condition|Price):\s*[^\n\r]+/gi, "").replace(/\s+/g, " ").trim();
+        }
+      } catch (e) {
+        // ignore errors
+      } finally {
+        if (pdpPage) await pdpPage.close().catch(() => {});
       }
+    }));
+  }
 
-      await pdpPage.waitForFunction(
-        () => (document.body.innerText || "").length > 100,
-        { timeout: 3000 }
-      ).catch(() => {});
-
-      const data = await pdpPage.evaluate(() => {
-        let description = "";
-        const descEl = document.querySelector("#tab-description, .woocommerce-Tabs-panel--description, .product-description, .woocommerce-product-details__short-description");
-        if (descEl) {
-          description = (descEl.innerText || descEl.textContent || "").trim();
-        } else {
-           const summary = document.querySelector(".summary, .entry-summary");
-           if (summary) description = (summary.innerText || summary.textContent || "").trim();
-        }
-        
-        // Remove pricing, SKU, and condition lines
-        description = description
-           .replace(/\b(SKU|Condition|Price):\s*[^\n\r]+/gi, "")
-           .replace(/\$[\d,]+\.?\d*/g, "")
-           .replace(/\s+/g, " ")
-           .trim();
-
-        // Extract specs from WooCommerce attributes table
-        const specs = {};
-        document.querySelectorAll(".woocommerce-product-attributes tr, #tab-additional_information tr").forEach(row => {
-          const label = (row.querySelector("th")?.textContent || "").trim();
-          const value = (row.querySelector("td")?.textContent || "").trim();
-          if (label && value && label.length < 40) {
-            const key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
-            specs[key] = value;
-          }
-        });
-
-        // Extract from product meta
-        const skuEl = document.querySelector(".sku");
-        if (skuEl) specs.sku = skuEl.textContent.trim();
-        
-        // Extract specs from JSON-LD if present
-        document.querySelectorAll('script[type="application/ld+json"]').forEach(el => {
-          try {
-            const data = JSON.parse(el.textContent);
-            if (data["@type"] === "Product") {
-              if (data.brand?.name && !specs.brand) specs.brand = data.brand.name;
-              if (data.model && !specs.model) specs.model = data.model;
-            }
-          } catch {}
-        });
-
-        // Parse structured label:value lines from description text
-        const SKIP_LABELS = /^(price|shipping|payment|item\s*location|location|tax|description|sku|condition|ffl|please|note|we\s)/i;
-        const lines = description.split(/\n|\r/);
-        for (const line of lines) {
-          const match = line.trim().match(/^([A-Za-z][A-Za-z\s/]{1,30}):\s*(.+)/);
-          if (match) {
-            const label = match[1].trim();
-            const value = match[2].trim();
-            if (label.length > 1 && value.length > 0 && value.length < 150 && !SKIP_LABELS.test(label)) {
-              const key = label.toLowerCase().replace(/\s+(.)/g, (_, c) => c.toUpperCase());
-              if (key === "manufacturer") { if (!specs.brand) specs.brand = value; }
-              else if (!specs[key]) specs[key] = value;
-            }
-          }
-        }
-
-        return { description, ...specs };
-      });
-
-      pdpDataMap[pdpUrl] = data;
-    } catch (e) {
-      console.warn(`[${sourceName}] PDP failed for ${pdpUrl.substring(pdpUrl.lastIndexOf('/')+1, pdpUrl.lastIndexOf('/')+30)}: ${e.message || e}`);
-    } finally {
-      if (pdpPage) await pdpPage.close().catch(() => {});
-    }
-  }));
-
-  // Build results
   const results = [];
-  for (const l of pdpTargets) {
+  for (const l of matchedTargets) {
     const p = parseUsdPrice(l.price);
     if (p == null || p <= 0) continue;
 
-    const pdp = pdpDataMap[l.url] || {};
     const title = cleanTitle(l.title);
-    
-    let rawCondition = pdp.condition || extractCondition(l.title, l.description) || "Unknown";
-    const condition = normalizeCondition(rawCondition);
+    const fullDescription = pdpDataMap[l.url] || l.description || "";
+    const condition = extractCondition(l.title, fullDescription);
 
     results.push({
       sourceName,
       pageUrl: l.url,
       title: title || null,
-      description: (pdp.description || l.description || "").toLowerCase(),
-      ...pdp,
+      description: fullDescription.toLowerCase(),
       condition,
-      model: pdp.model || model || "",
+      brand: brand || "",
+      model: model || "",
+      caliber: caliber || "",
       price: { currency: "USD", original: p },
     });
   }

@@ -1,4 +1,11 @@
-import { ensureNotBlocked, parseUsdPrice, extractBrandAndCaliber } from "./_util.js";
+import {
+  ensureNotBlocked,
+  parseUsdPrice,
+  extractBrandAndCaliber,
+  modelMatches,
+  listingShowsDifferentCaliberThanSearch,
+  CALIBER_MAP,
+} from "./_util.js";
 
 export const sourceName = "truegunvalue";
 
@@ -13,6 +20,47 @@ const FIREARM_TYPE_TO_CATEGORY = {
   RIFLE: "rifle",
   SHOTGUN: "shotgun",
 };
+
+/** CALIBER: cell sometimes aligns with wrong column (e.g. "MANF. PART #:"). */
+function trueGunChunkCaliberIsJunk(s) {
+  const u = String(s || "").trim().toUpperCase();
+  if (!u || u.length > 72) return true;
+  if (
+    /\b(MANF|MFG)\b.*\bPART\b|\bPART\s*#|SKU\s*:?\s*|UPC\s*:?\s*|GTIN\s*:?\s*|ITEM\s*#|^MODEL\s*:|^CONDITION\s*:|^MANUFACTURER\s*:/i.test(
+      u
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function caliberMatchesKnownPattern(text) {
+  const up = String(text || "").trim().toUpperCase();
+  if (!up) return false;
+  return CALIBER_MAP.some((e) => e.patterns.some((p) => p.test(up)));
+}
+
+/**
+ * Use CALIBER: field only if plausible; else infer from title; else skip listing (null).
+ */
+function resolveTrueGunListingCaliber(chunkCaliber, title) {
+  const chunk = String(chunkCaliber || "").trim();
+
+  if (chunk && !trueGunChunkCaliberIsJunk(chunk) && caliberMatchesKnownPattern(chunk)) {
+    return chunk;
+  }
+
+  const t = title || "";
+  const fromTitleKey = extractBrandAndCaliber(t).caliber;
+  if (fromTitleKey && caliberMatchesKnownPattern(fromTitleKey)) {
+    return fromTitleKey;
+  }
+
+  const upTitle = t.toUpperCase();
+  const hit = CALIBER_MAP.find((e) => e.patterns.some((p) => p.test(upTitle)));
+  return hit ? hit.key : null;
+}
 
 function trueGunValueResultsUrl(categoryValue, query) {
   const slug = encodeURIComponent(query).replace(/%20/g, "-").replace(/%2F/g, "-");
@@ -31,15 +79,9 @@ function trueGunValueResultsUrl(categoryValue, query) {
  * We extract each block and validate the MODEL field against the searched model
  * to filter out unrelated guns (e.g. G26, G17 when searching for G19).
  */
-function listingsFromScrapedText(text, searchModel) {
+function listingsFromScrapedText(text, searchModel, searchedCaliber, fullQuery) {
   const lines = String(text || "").split(/\n/);
   const out = [];
-
-  // Normalize the search model for flexible matching
-  // "19" should match "G19", "19 GEN5", "G19 GEN5", etc.
-  const modelNorm = String(searchModel || "").trim().toUpperCase();
-  // Strip leading letters like "G" from "G19" to get core digits
-  const modelBase = modelNorm.replace(/^[A-Z]+/, "") || modelNorm;
 
   for (let i = 0; i < lines.length; i++) {
     const priceMatch = lines[i].match(/^PRICE:\s*(.+)$/);
@@ -61,12 +103,18 @@ function listingsFromScrapedText(text, searchModel) {
     const mMatch = chunk.match(/MODEL:\s*([^\t\r\n]+)/);
     if (mMatch) model = mMatch[1].trim().toUpperCase();
 
-    // Validate: model must contain the searched model number
-    // e.g. searching "19" should match "G19", "G19 GEN5", "19 GEN4"
-    //       but NOT "G17", "G26", "G43"
-    if (model && modelBase) {
-      const modelClean = model.replace(/^G/, ""); // "G19 GEN5" → "19 GEN5"
-      if (!modelClean.startsWith(modelBase) && !model.includes(modelNorm)) {
+    // Validate: listing model must match searched model (flexible word-by-word)
+    // TrueGunValue often stores just the number (e.g. "12") while we search "Model 12"
+    if (model && searchModel) {
+      const cleanSearchModel = searchModel.toUpperCase().replace(/\bMODEL\b\s*/gi, "").trim();
+      const cleanListingModel = model.toUpperCase().trim();
+      const exactMatch = modelMatches(model, searchModel);
+      const strippedMatch = cleanSearchModel && (
+        cleanListingModel === cleanSearchModel ||
+        cleanListingModel.includes(cleanSearchModel) ||
+        cleanSearchModel.includes(cleanListingModel)
+      );
+      if (!exactMatch && !strippedMatch) {
         continue; // Different gun model — skip
       }
     }
@@ -103,7 +151,25 @@ function listingsFromScrapedText(text, searchModel) {
       title = [manufacturer, model, caliber].filter(Boolean).join(" ");
     }
 
-    out.push({ price, condition, model, title, caliber, manufacturer });
+    const resolvedCaliber = resolveTrueGunListingCaliber(caliber, title);
+    if (resolvedCaliber == null) {
+      continue;
+    }
+
+    if (
+      listingShowsDifferentCaliberThanSearch(resolvedCaliber, title, searchedCaliber, fullQuery)
+    ) {
+      continue;
+    }
+
+    out.push({
+      price,
+      condition,
+      model,
+      title,
+      caliber: resolvedCaliber,
+      manufacturer,
+    });
   }
   return out;
 }
@@ -122,7 +188,7 @@ function conditionTypeFromCondition(conditionRaw) {
   return "UNKNOWN";
 }
 
-export async function scrape({ page, query, firearmType, model }) {
+export async function scrape({ page, query, firearmType, model, caliber = "" }) {
   const categoryKey = FIREARM_TYPE_TO_CATEGORY[String(firearmType || "").trim().toUpperCase()];
   if (!categoryKey) return [];
   const categoryValue = CATEGORY_SELECT_VALUE[categoryKey];
@@ -135,7 +201,10 @@ export async function scrape({ page, query, firearmType, model }) {
     : (query.split(/\s+/).length >= 2 ? query.split(/\s+/).slice(1, -1).join(" ") : "");
 
   console.log(`[${sourceName}] ${pdpUrl}`);
-  await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: 10_000 });
+  // Stay under scraperService withTimeout: leave a few seconds for ensureNotBlocked + evaluate.
+  const scrapeBudget = Number(process.env.SCRAPE_TIMEOUT_MS) || 15000;
+  const navTimeout = Math.max(12_000, scrapeBudget - 3500);
+  await page.goto(pdpUrl, { waitUntil: "domcontentloaded", timeout: navTimeout });
   await ensureNotBlocked(page, `${sourceName}: after navigation`);
 
   const text = await page.evaluate(() => {
@@ -144,11 +213,11 @@ export async function scrape({ page, query, firearmType, model }) {
     return (root.innerText || "").trim();
   });
 
-  const allListings = listingsFromScrapedText(text, searchModel);
+  const allListings = listingsFromScrapedText(text, searchModel, caliber, query);
   console.log(`[${sourceName}] Parsed ${allListings.length} matching listing(s) (model filter: "${searchModel}").`);
 
   return allListings.slice(0, 4).map((l) => {
-    const extracted = extractBrandAndCaliber(l.title);
+    const extracted = extractBrandAndCaliber(l.title || "");
 
     return {
       sourceName,
@@ -159,7 +228,7 @@ export async function scrape({ page, query, firearmType, model }) {
       description: "",
       model: l.model || "",
       brand: l.manufacturer || extracted.brand,
-      caliber: l.caliber || extracted.caliber,
+      caliber: l.caliber || extracted.caliber || "",
       price: { currency: "USD", original: l.price },
     };
   });

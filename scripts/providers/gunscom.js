@@ -13,7 +13,9 @@ import {
   extractKeywords,
   isRelevant,
   normalizeCondition,
-  extractSpecsFromHtml
+  extractSpecsFromHtml,
+  modelMatches,
+  CALIBER_MAP
 } from "./_util.js";
 
 export const sourceName = "gunscom";
@@ -103,7 +105,7 @@ async function fetchPdpData(pdpUrl, apiKey) {
 // ── Main entry ───────────────────────────────────────────────────────────────
 
 export async function scrape({ page, query, model, firearmType }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "7260a6ebef2b9568767d0c2cb1c03515";
+  const apiKey = process.env.SCRAPER_API_KEY || "9c2b60714d381b52838ca7bb29ea0c58";
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
@@ -156,17 +158,16 @@ export async function scrape({ page, query, model, firearmType }) {
     const upBrand = (query.split(" ")[0] || "").toUpperCase();
     const upModel = (model || "").toUpperCase();
 
-    const calibers = [".45", "9MM", ".40", ".380", ".22", ".357", ".44", "10MM", ".223", "5.56", ".308", "7.62"];
-    const hasCaliber = calibers.some(c => title.includes(c));
+    const hasCaliber = CALIBER_MAP.some(entry => entry.patterns.some(p => p.test(title)));
     const hasBrand = title.includes(upBrand);
-    const hasModel = upModel ? title.includes(upModel) : true;
+    const hasModel = modelMatches(title, upModel);
 
     if (hasBrand && hasModel && hasCaliber) {
       if (/\b(MOULD|MOLD|DIE[S]?|RELOADING)\b/i.test(title)) return false;
-      return true;
+      return isRelevant(l.title, keywords, sourceName, model, query);
     }
 
-    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model);
+    return !isAccessory(l.title) && isRelevant(l.title, keywords, sourceName, model, query);
   });
 
   console.log(`[${sourceName}] After site-specific filters: ${relevant.length} relevant listing(s).`);

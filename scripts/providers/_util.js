@@ -1,3 +1,98 @@
+import { fileURLToPath } from "url";
+
+/** Shotgun gauge rows — include run-on (12ga), hyphenated, and common seller typos. */
+function shotgunGaugePatterns(n) {
+  const s = String(n);
+  return [
+    new RegExp(`\\b${s}\\s?GAUGE\\b`, "i"),
+    new RegExp(`\\b${s}\\s?GA\\b`, "i"),
+    new RegExp(`\\b${s}GA\\b`, "i"),
+    new RegExp(`\\b${s}\\s*-\\s*GA(?:UGE)?\\b`, "i"),
+    new RegExp(`\\b${s}\\s+gauge\\b`, "i"),
+  ];
+}
+
+export const CALIBER_MAP = [
+  // Handgun & Rifle — order matters: longer / multi-digit cartridges before ".45"
+  // so "5.56X45" does not match the ".45" entry via a bare "45" suffix.
+  { key: "9MM", patterns: [/\b9MM\b/, /\b9\s?X\s?19\b/, /\b9\s?MM\b/] },
+  { key: ".380", patterns: [/\.?380\b/, /\b380\s?ACP\b/, /\b380\s?AUTO\b/] },
+  {
+    key: ".223",
+    patterns: [
+      /\.?223\b/,
+      /\b5\.56\b/,
+      /\b556\b/,
+      /5\.56\s*[x×]\s*45/i,
+      /\b5\.56X45MM?\b/i,
+      /\b556\s*NATO\b/i,
+      /\b5\.56\s*NATO\b/i,
+    ],
+  },
+  { key: ".308", patterns: [/\.?308\b/, /\b7\.62\b/, /\b762\b/] },
+  { key: ".44", patterns: [/\.?44\b/, /\b44\s?MAG\b/, /\b44\s?SPECIAL\b/] },
+  { key: ".40", patterns: [/\.?40\b/, /\b40\s?S&W\b/, /\b40\s?SW\b/] },
+  {
+    key: ".45",
+    patterns: [
+      /(?<![xX/.\d])\.?45\b(?![\d])/i,
+      /\b45\s?ACP\b/i,
+      /\b45\s?AUTO\b/i,
+      /\b45\s?LC\b/i,
+      /\b45\s?COLT\b/i,
+    ],
+  },
+  { key: ".357", patterns: [/\.?357\b/, /\b357\s?MAG\b/] },
+  { key: ".22", patterns: [/\.?22\b/, /\b22\s?LR\b/] },
+  // Shotgun Gauges (patterns cover "12 ga", "12ga", "12-GA", "12 gauge", etc.)
+  { key: "12GA", patterns: shotgunGaugePatterns(12) },
+  { key: "20GA", patterns: shotgunGaugePatterns(20) },
+  { key: "16GA", patterns: shotgunGaugePatterns(16) },
+  { key: "28GA", patterns: shotgunGaugePatterns(28) },
+  { key: "10GA", patterns: shotgunGaugePatterns(10) },
+  { key: ".410", patterns: [/\.?410\s?(?:GAUGE|GA|BORE)?\b/i] },
+];
+
+/** Resolve which CALIBER_MAP entry the user is searching for; prefer explicit caliber string over full query. */
+export function resolveSearchCaliberEntry(upQuery, explicitCaliberUpper = "") {
+  const hints = [explicitCaliberUpper, upQuery].filter((h) => h && String(h).trim());
+  for (const hint of hints) {
+    const h = String(hint).toUpperCase();
+    const entry = CALIBER_MAP.find(
+      (e) => e.patterns.some((p) => p.test(h)) || h.includes(e.key)
+    );
+    if (entry) return entry;
+  }
+  return null;
+}
+
+/**
+ * True if listing text explicitly mentions a different mapped caliber/gauge than the user search
+ * (e.g. search 12 GA, listing says 16 GA). Empty or ambiguous listing text → false.
+ */
+export function listingShowsDifferentCaliberThanSearch(
+  listingCaliberText,
+  titleOrExtraText = "",
+  explicitCaliberHint = "",
+  fullQuery = ""
+) {
+  const searchEntry = resolveSearchCaliberEntry(
+    String(fullQuery || "").toUpperCase(),
+    String(explicitCaliberHint || "").toUpperCase()
+  );
+  if (!searchEntry) return false;
+  const combined = [listingCaliberText, titleOrExtraText].filter(Boolean).join(" ");
+  const up = combined.toUpperCase().replace(/\s+/g, " ").trim();
+  if (!up) return false;
+  for (const other of CALIBER_MAP) {
+    if (other.key === searchEntry.key) continue;
+    if (other.patterns.some((p) => p.test(up))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Shared utility functions for firearm scraper providers.
  *
@@ -232,10 +327,107 @@ export async function ensureNotBlocked(page, contextLabel) {
   }
 }
 
+// ── PDP breadcrumb (category trail) ─────────────────────────────────────────
+
+/**
+ * Collects category breadcrumbs from JSON-LD (BreadcrumbList) and common DOM patterns.
+ * @param {import("cheerio").CheerioAPI} $ Cheerio root for the PDP HTML
+ * @returns {string} e.g. "Firearms > Shotguns > Semi-Auto"
+ */
+export function extractBreadcrumbTrailFrom$($) {
+  const order = [];
+  const seen = new Set();
+
+  function push(t) {
+    const s = String(t || "")
+      .replace(/\s+/g, " ")
+      .replace(/^[/>»\s-]+|[/>»\s-]+$/g, "")
+      .trim();
+    if (s.length < 2) return;
+    if (/^home$/i.test(s)) return;
+    const low = s.toLowerCase();
+    if (seen.has(low)) return;
+    seen.add(low);
+    order.push(s);
+  }
+
+  $('script[type="application/ld+json"]').each((_, el) => {
+    const raw = $(el).html();
+    if (!raw) return;
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const nodes = Array.isArray(data) ? data : [data];
+    for (const node of nodes) {
+      const types = node["@type"];
+      const typeList = Array.isArray(types) ? types : types ? [types] : [];
+      if (!typeList.includes("BreadcrumbList") || !Array.isArray(node.itemListElement)) continue;
+      const items = [...node.itemListElement].sort(
+        (a, b) => Number(a.position || 0) - Number(b.position || 0)
+      );
+      for (const it of items) {
+        let name = typeof it.name === "string" ? it.name : "";
+        if (!name && it.item && typeof it.item === "object" && typeof it.item.name === "string") {
+          name = it.item.name;
+        }
+        push(name);
+      }
+    }
+  });
+
+  if (order.length === 0) {
+    const domSelectors = [
+      ".breadcrumbs li",
+      ".breadcrumbs a",
+      ".breadcrumb li",
+      ".breadcrumb a",
+      '[itemtype*="BreadcrumbList"] li',
+      "nav.breadcrumbs li",
+      "nav.breadcrumbs a",
+      ".page-wrapper .breadcrumbs a",
+      ".page-title-wrapper .breadcrumbs li",
+      "#woocommerce-breadcrumb a",
+      ".woocommerce-breadcrumb a",
+    ];
+    for (const sel of domSelectors) {
+      $(sel).each((_, el) => {
+        const t = $(el).text().replace(/\s+/g, " ").trim();
+        if (!t || /^[\/>»]+$/i.test(t)) return;
+        push(t);
+      });
+      if (order.length >= 2) break;
+    }
+  }
+
+  return order.join(" > ");
+}
+
+/**
+ * True when the store category trail is clearly parts, ammo, reloading, or accessories (not complete firearms).
+ * Unknown or empty trails return false.
+ */
+export function breadcrumbTrailImpliesNonFirearm(trail) {
+  const j = String(trail || "")
+    .replace(/[:;|\\/]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (j.length < 4) return false;
+
+  const BAD =
+    /\b(GUN\s+PARTS|FIREARM\s+PARTS|SHOTGUN\s+PARTS|PISTOL\s+PARTS|RIFLE\s+PARTS|AR\s+PARTS|UPPER\s+PARTS|LOWER\s+PARTS|SLIDE\s+PARTS|FRAME\s+PARTS|PARTS\s+&\s*ACCESSOR|PARTS\s+AND\s+ACCESSOR|ACCESSORIES|RELOADING|AMMUNITION|\bAMMO\b(?!NITION\b)|POWDER\b|PRIMERS?\b|\bBRASS\b|\bBULLETS?\b|PROJECTILES?\b|HOLSTERS?|OPTICS|SCOPES?|CLEANING\s+(?:SUPPLIES|SUPPLY|KIT|GEAR)|MAGAZINES?(?!SPRING\b)|CHOKE\s+TUB|FLASHLIGHTS?|LASERS?|ARCHERY|APPAREL|GIFTS?|BOOKS|KNIVES)\b/i;
+
+  return BAD.test(j);
+}
+
 // ── Firearm Filtering & Relevance ───────────────────────────────────────────
 
-const ACCESSORY_RE = /\b(HOLSTER[S]?|SCOPE[S]?|OPTIC[S]?|SLING[S]?|CLEANING|AMMO|BAYONET[S]?|PARTS KIT|MANUAL[S]?|CONVERSION KIT|LOADER[S]?|LASER[S]?|FLASHLIGHT[S]?|SUPPRESSOR[S]?|SILENCER[S]?|KNIFE|KNIVES|DIE[S]?|RELOADING|PRESS|SCALE|BULLET[S]?|PROJECTILE[S]?|BIPOD[S]?|TRIPOD[S]?|BAG[S]?|MOULD|MOLD)\b/i;
-const ACCESSORY_BRAND_RE = /\b(ETS|RWB|PMAG|MAGPUL|HEXMAG|E-LANDER|EMTAN|KCI|VORTEX|LEUPOLD|TRIJICON|HOLOSUN|PAST|CALDWELL|WHEELER|LEE|RCBS|HORANDY|LYMAN|DILLON)\b/i;
+// Omit SCOPE/OPTIC/SLING/SCALE: they appear in real gun copy ("scope mounts", "sling swivels", "Rockwell scale", legal "scope of").
+const ACCESSORY_RE = /\b(HOLSTER[S]?|CLEANING|AMMO|BAYONET[S]?|PARTS KIT|MANUAL[S]?|CONVERSION KIT|LOADER[S]?|LASER[S]?|FLASHLIGHT[S]?|SUPPRESSOR[S]?|SILENCER[S]?|KNIFE|KNIVES|DIE[S]?|RELOADING|PRESS|BULLET[S]?|PROJECTILE[S]?|BIPOD[S]?|TRIPOD[S]?|BAG[S]?|MOULD|MOLD)\b/i;
+// Note: avoid "PAST" alone — matches common English ("in the past") inside long PDP/legal text passed to isAccessory.
+const ACCESSORY_BRAND_RE = /\b(ETS|RWB|PMAG|MAGPUL|HEXMAG|E-LANDER|EMTAN|KCI|VORTEX|LEUPOLD|TRIJICON|HOLOSUN|CALDWELL|WHEELER|LEE|RCBS|HORANDY|LYMAN|DILLON)\b/i;
 
 /**
  * Checks if a title likely refers to an accessory rather than a firearm.
@@ -244,15 +436,12 @@ export function isAccessory(title, searchedBrand = "") {
   const upper = String(title || "").toUpperCase().trim();
   if (!upper) return true;
 
+  // Long PDP blobs (e.g. GunBroker) repeat words like "SCOPE" ("scope of liability") — only scan listing copy.
+  const head = upper.length > 3500 ? upper.slice(0, 3500) : upper;
+
   // 1. Common accessories (unambiguous)
-  if (ACCESSORY_RE.test(upper)) {
-    console.log(`[debug] Flagged as accessory (matched broad regex): ${title}`);
-    return true;
-  }
-  if (ACCESSORY_BRAND_RE.test(upper)) {
-    console.log(`[debug] Flagged as accessory (matched accessory brand): ${title}`);
-    return true;
-  }
+  if (ACCESSORY_RE.test(head)) return true;
+  if (ACCESSORY_BRAND_RE.test(head)) return true;
 
   // 2. Parts that might be in descriptions (only block if they look like standalone items)
   // Subject: [Brand] [Model] [Part]
@@ -274,30 +463,20 @@ export function isAccessory(title, searchedBrand = "") {
       // If it's a specific gun model + part, e.g. "Glock 19 Magazine" vs "Glock 19 9mm ... 2 Mags"
       // If the part name is the primary noun (usually at the end or following the brand/model)
       // We block if it looks like a part listing
-      if (new RegExp(`\\b(FOR|FITS)\\b.*\\b${part}\\b`, "i").test(upper)) {
-        console.log(`[debug] Flagged as accessory (Fits/For ${part}): ${title}`);
-        return true;
-      }
+      if (new RegExp(`\\b(FOR|FITS)\\b.*\\b${part}\\b`, "i").test(upper)) return true;
 
       // If the title ENDS with the part keyword, it's almost certainly an accessory
       // e.g. "Mesa Tactical Benelli M4 12 Gauge Urbino Pistol Grip Stock"
-      if (new RegExp(`\\b${part}[S]?\\s*$`, "i").test(upper)) {
-        console.log(`[debug] Flagged as accessory (title ends with ${part}): ${title}`);
-        return true;
-      }
+      if (new RegExp(`\\b${part}[S]?\\s*$`, "i").test(upper)) return true;
 
       // If the title is SHORT and contains the part name, it's likely a part
-      if (upper.split(" ").length < 6) {
-        console.log(`[debug] Flagged as accessory (Short title + part): ${title}`);
-        return true;
-      }
+      if (upper.split(" ").length < 6) return true;
     }
   }
 
   // 3. Fallback: Check for "FOR [Brand]"
   const GENERAL_BRANDS = "GLOCK|SIG|COLT|SMITH|WESSON|RUGER|BERETTA|CZ|WALTHER|SPRINGFIELD|TAURUS|HK|BROWNING|REMINGTON";
   if (new RegExp(`\\bFOR\\s+(${GENERAL_BRANDS})\\b`, "i").test(upper) && !/\bPISTOL|RIFLE|SHOTGUN|REVOLVER\b/i.test(upper)) {
-    console.log(`[debug] Flagged as accessory (For Brand): ${title}`);
     return true;
   }
 
@@ -306,7 +485,7 @@ export function isAccessory(title, searchedBrand = "") {
 
 const CALIBRE_NOISE = new Set([
   "MM", "LUGER", "ACP", "AUTO", "MAG", "MAGNUM", "SPECIAL", "WIN",
-  "WINCHESTER", "REM", "REMINGTON", "NATO", "GAP", "SUPER", "SHORT",
+  "REM", "NATO", "GAP", "SUPER", "SHORT",
   "LONG", "RIFLE", "PISTOL", "SHOTGUN", "GAUGE", "GA", "FOR", "SALE",
 ]);
 
@@ -324,69 +503,108 @@ export function extractKeywords(query) {
 }
 
 /**
+ * Flexible model matching — checks if a title contains the model.
+ * First tries exact substring, then falls back to word-by-word matching.
+ * e.g. model "M&P Shield" matches title "M&P9 Shield Plus" because
+ * both words "M&P" and "SHIELD" appear in the title individually.
+ */
+export function modelMatches(title, model) {
+  if (!model) return true;
+  const upTitle = (title || "").toUpperCase();
+  const upModel = model.toUpperCase().trim();
+  if (!upModel) return true;
+
+  // Avoid "Model 12" matching "MODEL 1200" via naive substring / digit substring
+  if (/\d/.test(upModel)) {
+    const esc = upModel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(^|[^A-Z0-9])${esc}([^A-Z0-9]|$)`, "i").test(upTitle)) return true;
+  } else if (upTitle.includes(upModel)) return true;
+
+  const modelWords = upModel.split(/\s+/).filter((w) => w.length >= 2);
+  const wordOk =
+    modelWords.length > 0 &&
+    modelWords.every((w) => {
+      if (/^\d+$/.test(w)) return new RegExp(`(^|[^0-9])${w}([^0-9]|$)`).test(upTitle);
+      return upTitle.includes(w);
+    });
+  if (wordOk) return true;
+
+  const winMdl = upModel.match(/^MODEL\s+(\d{1,3})\s*$/);
+  if (winMdl) {
+    const n = winMdl[1];
+    if (new RegExp(`\\bM[-\\s]?${n}\\b`).test(upTitle)) return true;
+    if (new RegExp(`\\bMOD\\.?\\s*${n}\\b`).test(upTitle)) return true;
+  }
+
+  // Catalog titles often space tokens ("SCAR 16S") vs user input "SCAR16S" — compare alphanumerics only.
+  const compactTitle = upTitle.replace(/[^A-Z0-9]/g, "");
+  const compactModel = upModel.replace(/[^A-Z0-9]/g, "");
+  if (compactModel.length >= 3 && compactTitle.includes(compactModel)) return true;
+
+  return false;
+}
+
+/**
  * Check if a title is relevant to the search keywords.
  * 
  * Strategy:
  * 1. Must match at least ONE keyword.
- * 2. If a model is provided, IT MUST MATCH.
+ * 2. If a model is provided, IT MUST MATCH (flexible word-by-word).
  * 3. Strictness depends on the source (Marketplace vs Retail).
  * 4. Conflict Check: Block if title contains a different caliber than the search.
  */
-export function isRelevant(title, keywords, sourceName = "", searchedModel = "") {
+export function isRelevant(
+  title,
+  keywords,
+  sourceName = "",
+  searchedModel = "",
+  fullQuery = "",
+  explicitCaliberHint = ""
+) {
   if (!title || !keywords || keywords.length === 0) return false;
   const up = title.toUpperCase();
-  const matches = keywords.filter(kw => up.includes(kw));
+  const upQuery = (fullQuery || keywords.join(" ")).toUpperCase();
+  const matches = keywords.filter(kw => up.includes(kw.toUpperCase()));
   
-  // 1. Must match at least ONE keyword (always)
+  // 1. Block accessories ...
+  if (isAccessory(title)) return false;
+
+  // 2. Must match at least ONE keyword (always)
   if (matches.length === 0) return false;
 
-  // 2. Mandatory Model Match (if provided)
-  if (searchedModel) {
-    const upModel = searchedModel.toUpperCase();
-    if (!up.includes(upModel)) return false;
+  // 3. Mandatory Model Match (flexible word-by-word)
+  if (searchedModel && !modelMatches(title, searchedModel)) {
+    return false;
   }
 
-  // 3. Adjust strictness based on source
-  const isMarketplace = ["gunbroker", "gunsinternational", "simpsonltd"].includes(sourceName);
+  // 4. Adjust strictness based on source
+  const isMarketplace = ["gunbroker", "gunsinternational", "simpsonltd", "budsgunshop"].includes(sourceName);
   
   if (isMarketplace) {
     const minRequired = Math.max(1, Math.ceil(keywords.length * 0.5));
-    if (matches.length < minRequired) {
-      console.log(`[debug] Rejected ${title} - matched only ${matches.length}/${keywords.length} keywords.`);
-      return false;
-    }
-  } else {
-    if (keywords.length >= 3 && matches.length < 2) {
-      console.log(`[debug] Rejected ${title} - matched only ${matches.length}/${keywords.length} keywords.`);
-      return false;
-    }
+    if (matches.length < minRequired) return false;
+  } else if (keywords.length >= 3 && matches.length < 2) {
+    return false;
   }
 
-  // 4. Conflict Check (Calibers)
-  // ... (caliber map definition) ...
-  const caliberMap = [
-    { key: ".45", patterns: [/\.?45\b/, /\b45\s?ACP\b/, /\b45\s?LC\b/, /\b45\s?COLT\b/] },
-    { key: "9MM", patterns: [/\b9MM\b/, /\b9\s?X\s?19\b/, /\b9\s?MM\b/] },
-    { key: ".44", patterns: [/\.?44\b/, /\b44\s?MAG\b/, /\b44\s?SPECIAL\b/] },
-    { key: ".40", patterns: [/\.?40\b/, /\b40\s?S&W\b/, /\b40\s?SW\b/] },
-    { key: ".380", patterns: [/\.?380\b/, /\b380\s?ACP\b/] },
-    { key: ".22", patterns: [/\.?22\b/, /\b22\s?LR\b/] },
-    { key: ".357", patterns: [/\.?357\b/, /\b357\s?MAG\b/] },
-    { key: ".223", patterns: [/\.?223\b/, /\b5\.56\b/, /\b556\b/] },
-    { key: ".308", patterns: [/\.?308\b/, /\b7\.62\b/, /\b762\b/] },
-  ];
+  // 5. Conflict Check (Calibers)
+  // Prefer explicit caliber (e.g. "12 ga") so model numbers like "Model 12" in the query do not steal resolution.
+  const upExplicit = String(explicitCaliberHint || "").toUpperCase();
+  let searchCalEntry = resolveSearchCaliberEntry(upQuery, upExplicit);
 
-  const searchCalEntry = caliberMap.find(entry => 
-    keywords.some(kw => entry.patterns.some(p => p.test(kw)) || kw === entry.key)
-  );
+  if (!searchCalEntry) {
+    searchCalEntry = CALIBER_MAP.find((entry) =>
+      keywords.some((kw) => {
+        const upKw = kw.toUpperCase();
+        return entry.patterns.some((p) => p.test(upKw)) || upKw === entry.key;
+      })
+    );
+  }
 
   if (searchCalEntry) {
-    for (const otherEntry of caliberMap) {
+    for (const otherEntry of CALIBER_MAP) {
       if (otherEntry.key === searchCalEntry.key) continue;
-      if (otherEntry.patterns.some(p => p.test(up))) {
-        console.log(`[debug] Rejected ${title} - Caliber conflict: searched ${searchCalEntry.key} but found ${otherEntry.key}`);
-        return false;
-      }
+      if (otherEntry.patterns.some((p) => p.test(up))) return false;
     }
   }
 
@@ -401,19 +619,7 @@ export function extractBrandAndCaliber(title, keywords = []) {
   const up = title.toUpperCase();
 
   // 1. Extract Caliber using the same pattern logic as isRelevant
-  const caliberMap = [
-    { key: ".45", patterns: [/\.?45\b/, /\b45\s?ACP\b/, /\b45\s?LC\b/, /\b45\s?COLT\b/] },
-    { key: "9MM", patterns: [/\b9MM\b/, /\b9\s?X\s?19\b/, /\b9\s?MM\b/] },
-    { key: ".44", patterns: [/\.?44\b/, /\b44\s?MAG\b/, /\b44\s?SPECIAL\b/] },
-    { key: ".40", patterns: [/\.?40\b/, /\b40\s?S&W\b/, /\b40\s?SW\b/] },
-    { key: ".380", patterns: [/\.?380\b/, /\b380\s?ACP\b/] },
-    { key: ".22", patterns: [/\.?22\b/, /\b22\s?LR\b/] },
-    { key: ".357", patterns: [/\.?357\b/, /\b357\s?MAG\b/] },
-    { key: ".223", patterns: [/\.?223\b/, /\b5\.56\b/, /\b556\b/] },
-    { key: ".308", patterns: [/\.?308\b/, /\b7\.62\b/, /\b762\b/] },
-  ];
-
-  let caliber = caliberMap.find(entry => entry.patterns.some(p => p.test(up)))?.key || null;
+  let caliber = CALIBER_MAP.find(entry => entry.patterns.some(p => p.test(up)))?.key || null;
 
   // 2. Extract Brand
   const BRANDS = [
