@@ -1,5 +1,5 @@
 {
-  "quickQuoteRequest": {
+
     "firearm": {
       "firearmType": "SHOTGUN",
       "brand": "Winchester",
@@ -7,4 +7,3 @@
       "caliber": "12 Gauge"
     }
   }
-}

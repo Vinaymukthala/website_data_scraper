@@ -10,14 +10,15 @@
  */
 
 import { setTimeout as delay } from "node:timers/promises";
-import { 
-  parseUsdPrice, 
-  isAccessory, 
-  extractKeywords, 
+import {
+  parseUsdPrice,
+  isAccessory,
+  extractKeywords,
   isRelevant,
   normalizeCondition,
   modelMatches,
-  CALIBER_MAP
+  CALIBER_MAP,
+  PROVIDER_DEFAULT_CONDITIONS,
 } from "./_util.js";
 
 export const sourceName = "gunsinternational";
@@ -302,7 +303,10 @@ export async function scrape({ page, query, model, firearmType, caliber }) {
       continue;
     }
 
-    const rawCond = pdp.condition || l.condition || "Unknown";
+    const pdpCond = pdp.condition != null ? String(pdp.condition).trim() : "";
+    const fallbackCond = PROVIDER_DEFAULT_CONDITIONS[sourceName] || "Used";
+    const rawCond =
+      pdpCond && !/^unknown$/i.test(pdpCond) ? pdpCond : fallbackCond;
 
     results.push({
       sourceName,

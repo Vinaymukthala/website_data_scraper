@@ -1,4 +1,14 @@
-import OpenAI from 'openai';
+import OpenAI from "openai";
+
+/**
+ * OpenAI (optional): only used when `OPENAI_API_KEY` is set and a feature is turned on.
+ *
+ * | Variable | Role |
+ * |----------|------|
+ * | `OPENAI_API_KEY` | Required for any LLM call. If unset, all helpers no-op / use scraped text only. |
+ * | `USE_LLM_NORMALIZE` | Set `1` or `true` to run `normalizeInput()` through the model (typos, firearmType). Default: off — input is passed through unchanged. |
+ * | `OPENAI_MODEL` | Optional chat model id (default `gpt-5.4-mini`). Used for normalize and GunBroker enrich. |
+ */
 
 let openaiInstance = null;
 
@@ -11,6 +21,10 @@ function getOpenAI() {
   return openaiInstance;
 }
 
+function resolveChatModel() {
+  return process.env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
+}
+
 /** When true (`1` / `true`), OpenAI may normalize input. Default: off — pass input through unchanged. */
 function isUseLlmNormalizeEnabled() {
   const v = process.env.USE_LLM_NORMALIZE;
@@ -21,10 +35,6 @@ function isUseLlmNormalizeEnabled() {
  * Normalizes firearm input using an LLM.
  * Corrects typos in brand, model, caliber, and infers the firearmType if missing.
  *
- * Env:
- *   USE_LLM_NORMALIZE   `true` / `1` to enable LLM normalization (requires OPENAI_API_KEY). Default: disabled.
- *   SKIP_OPENAI_NORMALIZE  `1` / `true` forces skip even if USE_LLM_NORMALIZE is on.
- *
  * @param {Object} input - The raw user input { firearmType, brand, model, caliber }
  * @returns {Promise<Object>} - The normalized input, or original input if LLM fails
  */
@@ -32,10 +42,6 @@ export async function normalizeInput(input) {
   if (!isUseLlmNormalizeEnabled()) {
     return input;
   }
-  if (process.env.SKIP_OPENAI_NORMALIZE === "1" || process.env.SKIP_OPENAI_NORMALIZE === "true") {
-    return input;
-  }
-  // If no API key is set, skip normalization
   if (!process.env.OPENAI_API_KEY) {
     console.warn("[LLM] OPENAI_API_KEY is not set. Skipping normalization.");
     return input;
@@ -62,7 +68,7 @@ Only output the JSON. Do not include markdown formatting or explanation.
 `;
 
     const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_NORMALIZE_MODEL?.trim() || "gpt-5.4-mini",
+      model: resolveChatModel(),
       messages: [{ role: "user", content: prompt }],
       response_format: { type: "json_object" },
       temperature: 0.1,
@@ -136,7 +142,7 @@ Return strict JSON: {"summary": string, "firearmDetails": object}.`;
 
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-5.4-mini",
+      model: resolveChatModel(),
       messages: [{ role: "user", content: prompt }],
       response_format: { type: "json_object" },
       temperature: 0.2,

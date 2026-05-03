@@ -1,17 +1,16 @@
 {
-  "name": "parallel-semantic-search",
+  "name": "datascrapper",
   "private": true,
   "version": "3.0.0",
   "type": "module",
-  "main": "main.js",
+  "main": "scraperService.js",
   "scripts": {
-    "start": "node main.js",
-    "semantic": "node runSemanticCli.js parallel_semantic_payload.json",
-    "fallback": "node runFallbackCli.js parallel_semantic_payload.json"
+    "start": "node server.js",
+    "scrape": "node scraperService.js"
   },
   "dependencies": {
-    "fuse.js": "^7.3.0",
     "cheerio": "^1.2.0",
+    "express": "^5.2.1",
     "openai": "^6.35.0",
     "puppeteer": "^24.0.0",
     "puppeteer-extra": "^3.3.6",

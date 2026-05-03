@@ -19,6 +19,7 @@ import {
   parseUsdPrice,
   cleanDescription,
   breadcrumbTrailImpliesNonFirearm,
+  PROVIDER_DEFAULT_CONDITIONS,
 } from "./scripts/providers/_util.js";
 import { normalizeInput } from "./scripts/llmNormalizer.js";
 
@@ -47,18 +48,6 @@ const SKIP_BROWSER_PAGE_PROVIDERS = new Set([
   "grabagun",
   "palmettostatearmory",
 ]);
-
-const PROVIDER_DEFAULT_CONDITIONS = {
-  "gunbroker": "Used",
-  "gunsinternational": "Used",
-  "truegunvalue": "Used",
-  "grabagun": "New",
-  "budsgunshop": "New",
-  "palmettostatearmory": "New",
-  "gunscom": "Used",
-  "simpsonltd": "Used",
-  "collectorfirearms": "Used",
-};
 
 // ── Puppeteer setup ──────────────────────────────────────────────────────────
 
@@ -542,11 +531,15 @@ if (isCLI) {
     } else {
       const payloadPath = path.join(__dirname, "input_payload.json");
       const raw = JSON.parse(await fs.readFile(payloadPath, "utf8"));
-      input = raw.quickQuoteRequest?.firearm;
+      input =
+        raw.firearm ??
+        raw.quickQuoteRequest?.firearm ??
+        raw.metaQuery ??
+        raw.input?.metaQuery;
     }
 
     if (!input) {
-      console.error("No input found.");
+      console.error("No input found. Use input_payload.json with a \"firearm\" object (or quickQuoteRequest.firearm).");
       process.exit(1);
     }
 

@@ -272,6 +272,19 @@ export function conditionFromText(text) {
   return "Unknown";
 }
 
+/** Default listing condition when a provider returns Unknown / missing (single source of truth). */
+export const PROVIDER_DEFAULT_CONDITIONS = {
+  gunbroker: "Used",
+  gunsinternational: "Used",
+  truegunvalue: "Used",
+  grabagun: "New",
+  budsgunshop: "New",
+  palmettostatearmory: "New",
+  gunscom: "Used",
+  simpsonltd: "Used",
+  collectorfirearms: "Used",
+};
+
 /**
  * Normalize a raw condition string into one of the standard terms:
  * New, Excellent, Very Good, Good, Fair, Used
