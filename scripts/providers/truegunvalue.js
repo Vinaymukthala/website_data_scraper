@@ -7,7 +7,16 @@ import {
   CALIBER_MAP,
 } from "./_util.js";
 
+/**
+ * TrueGunValue — one category page lists multiple comps; each row uses a distinct `pageUrl` hash
+ * so `scraperService` dedupe-by-URL does not collapse them to a single listing.
+ *
+ * Env: `TRUEGUNVALUE_MAX_LISTINGS` (default 3, max 25) — aligns with other providers' per-site cap.
+ */
 export const sourceName = "truegunvalue";
+
+/** Max comps returned from the single results page (each row gets a unique #fragment on pageUrl so dedupe does not collapse them). */
+const MAX_LISTINGS = Math.min(25, Math.max(1, Number(process.env.TRUEGUNVALUE_MAX_LISTINGS) || 3));
 
 const CATEGORY_SELECT_VALUE = {
   handgun: "pistol",
@@ -216,14 +225,16 @@ export async function scrape({ page, query, firearmType, model, caliber = "" }) 
   const allListings = listingsFromScrapedText(text, searchModel, caliber, query);
   console.log(`[${sourceName}] Parsed ${allListings.length} matching listing(s) (model filter: "${searchModel}").`);
 
-  return allListings.slice(0, 4).map((l) => {
+  return allListings.slice(0, MAX_LISTINGS).map((l, idx) => {
     const extracted = extractBrandAndCaliber(l.title || "");
+    // Same category URL for every comp; scraperService dedupes by (source, pageUrl) — fragment makes each row distinct.
+    const pageUrl = `${pdpUrl}#comp-${idx}-${l.price}`;
 
     return {
       sourceName,
       condition: l.condition || "Unknown",
       conditionType: conditionTypeFromCondition(l.condition),
-      pageUrl: pdpUrl,
+      pageUrl,
       title: l.title || null,
       description: "",
       model: l.model || "",

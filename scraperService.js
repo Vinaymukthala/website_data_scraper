@@ -4,6 +4,7 @@
  * Exports:
  *   scrapeFirearm(input) → { query, sources, offerValue, errors, _meta }
  */
+import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
@@ -260,12 +261,52 @@ function dedupeSourcesByPageUrl(rows) {
   });
 }
 
+/**
+ * Keep at most N listings per `sourceName` (lowest price first).
+ * Env `MAX_LISTINGS_PER_SOURCE` overrides default 3 (clamped 1–25).
+ */
+function capListingsPerSourceName(rows, maxPerSource) {
+  const cap = Math.min(25, Math.max(1, Math.floor(Number(maxPerSource)) || 3));
+  const groups = new Map();
+  for (const row of rows) {
+    const sn = String(row.sourceName || "unknown");
+    if (!groups.has(sn)) groups.set(sn, []);
+    groups.get(sn).push(row);
+  }
+  const out = [];
+  for (const list of groups.values()) {
+    list.sort((a, b) => {
+      const pa = typeof a.price?.original === "number" ? a.price.original : Infinity;
+      const pb = typeof b.price?.original === "number" ? b.price.original : Infinity;
+      return pa - pb;
+    });
+    out.push(...list.slice(0, cap));
+  }
+  return out;
+}
+
 function validateInput(input) {
   const { firearmType, brand, model, caliber } = input || {};
 
   if (!firearmType || !brand || !model || !caliber) {
     throw new Error("Input must include firearmType, brand, model, and caliber");
   }
+}
+
+/** Common client typos for `firearmType` (does not invent type — only fixes known misspellings). */
+function canonicalizeFirearmType(raw) {
+  const u = String(raw || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+  const fixes = {
+    RIFILE: "RIFLE",
+    RIFEL: "RIFLE",
+    RFLIE: "RIFLE",
+    SHOTGAN: "SHOTGUN",
+    HANDGUNE: "HANDGUN",
+  };
+  return fixes[u] || String(raw || "").trim().toUpperCase();
 }
 
 // ── Core API ─────────────────────────────────────────────────────────────────
@@ -311,7 +352,7 @@ async function scrapeFirearm(rawInput) {
     const BRAND = String(input.brand).trim();
     const MODEL = String(input.model).trim();
     const CALIBER = String(input.caliber || "").trim();
-    const TYPE = String(input.firearmType || "").trim();
+    const TYPE = canonicalizeFirearmType(input.firearmType);
     const QUERY = [BRAND, MODEL, CALIBER].filter(Boolean).join(" ");
 
     /** PDP text often says "FN" while the user typed "FNH"; append query tokens for relevance / strict-match checks. */
@@ -484,7 +525,14 @@ async function scrapeFirearm(rawInput) {
       .filter(Boolean)
       .sort((a, b) => a.price.original - b.price.original);
 
-    const sources = dedupeSourcesByPageUrl(rawSources);
+    const maxPerSource = Math.min(
+      25,
+      Math.max(1, Number(process.env.MAX_LISTINGS_PER_SOURCE) || 3)
+    );
+    const sources = capListingsPerSourceName(
+      dedupeSourcesByPageUrl(rawSources),
+      maxPerSource
+    ).sort((a, b) => a.price.original - b.price.original);
 
     sources.forEach((source, index) => {
       source.sourceId = String(index + 1).padStart(3, "0");

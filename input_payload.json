@@ -1,9 +1,9 @@
 {
 
     "firearm": {
-      "firearmType": "SHOTGUN",
-      "brand": "Winchester",
-      "model": "Model 12",
-      "caliber": "12 Gauge"
+      "firearmType": "Rifle",
+      "brand": "FNH",
+      "model": "SCAR16S NRCH",
+      "caliber": "5.56x45mm"
     }
   }

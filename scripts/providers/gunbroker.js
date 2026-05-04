@@ -422,7 +422,7 @@ function parseGunBrokerSerp(html) {
 }
 
 export async function scrape({ page, query, model, firearmType, caliber = "", brand = "" }) {
-  const apiKey = process.env.SCRAPER_API_KEY || "9c2b60714d381b52838ca7bb29ea0c58";
+  const apiKey = process.env.SCRAPER_API_KEY;
   if (!apiKey) {
     console.warn(`[${sourceName}] SCRAPER_API_KEY not set — skipping.`);
     return [];
