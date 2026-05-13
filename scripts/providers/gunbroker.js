@@ -19,6 +19,8 @@ import {
   extractSpecsFromHtml,
   extractBrandAndCaliber
 } from "./_util.js";
+import { llmConfig } from "../../llm/config.js";
+import { maybeReviewAndRepairRow } from "../../llm/reviewRow.js";
 
 export const sourceName = "gunbroker";
 
@@ -28,13 +30,6 @@ const SEARCH_TIMEOUT_MS = Number(process.env.GB_SEARCH_TIMEOUT_MS) || 20_000;
 const PDP_TIMEOUT_MS = Number(process.env.GB_PDP_TIMEOUT_MS) || 15_000;
 const FIELD_BOUNDARY_RE = /\b(?:manufacturer|model|mfg model no|family|type|item group|action|caliber\/gauge|caliber|gauge|finish|finish type|stock\/grips|stock frame grips|barrel|barrel length|overall length|drilled \/ tapped|rate-?of-?twist|capacity|# of magazines|mag description|sights|sight type|optics\/sights|markings|serial|upc|weight|safety|frame|trigger|thread pattern|special feature|shipping|condition|country of origin|item condition)\s*:/i;
 const PLACEHOLDER_VALUE_RE = /^(other(?:\s+\w+){0,2}|n\/a|na|unknown|see description)$/i;
-const KNOWN_BRANDS = [
-  "COLT", "GLOCK", "SIG SAUER", "SIG", "SMITH & WESSON", "SMITH AND WESSON", "S&W",
-  "RUGER", "BERETTA", "CZ", "WALTHER", "SPRINGFIELD ARMORY", "SPRINGFIELD",
-  "TAURUS", "HECKLER & KOCH", "HECKLER AND KOCH", "H&K", "HK",
-  "BROWNING", "REMINGTON", "WINCHESTER", "SAVAGE", "MOSSBERG", "BENELLI",
-  "KIMBER", "HENRY", "DANIEL DEFENSE", "PALMETTO STATE ARMORY", "PSA"
-];
 
 function cleanFieldValue(rawValue) {
   let value = String(rawValue || "").replace(/\s+/g, " ").trim();
@@ -103,9 +98,9 @@ function normalizeGunBrokerSpecs(specs, title) {
 
   if (normalized.brand) {
     const upperBrand = normalized.brand.toUpperCase();
-    const titleBrand = KNOWN_BRANDS.find((brand) => upperTitle.includes(brand));
+    const titleBrand = extracted.brand ? extracted.brand.toUpperCase() : "";
     if (titleBrand && upperBrand !== titleBrand && !upperTitle.includes(upperBrand)) {
-      normalized.brand = titleBrand;
+      normalized.brand = extracted.brand;
     }
   }
 
@@ -442,7 +437,7 @@ export async function scrape({ page, query, model, firearmType }) {
   console.log(`[${sourceName}] PDP batch completed in ${Date.now() - pdpBatchStartedAt}ms.`);
 
   // Build results
-  const results = [];
+  const candidateRows = [];
   for (let i = 0; i < pdpTargets.length; i++) {
     const l = pdpTargets[i];
     const pdp = pdpResults[i] || {};
@@ -460,7 +455,7 @@ export async function scrape({ page, query, model, firearmType }) {
       else rawCond = "Used";
     }
 
-    results.push({
+    candidateRows.push({
       sourceName,
       pageUrl: l.url,
       title: l.title.slice(0, 200) || null,
@@ -473,6 +468,32 @@ export async function scrape({ page, query, model, firearmType }) {
       price: { currency: "USD", original: p },
     });
   }
+
+  const results = await Promise.all(
+    candidateRows.map(async (row, index) => {
+      if (index >= llmConfig.maxRowsPerProvider) {
+        return row;
+      }
+
+      const reviewOutcome = await maybeReviewAndRepairRow({
+        providerName: sourceName,
+        query: {
+          query,
+          model,
+          firearmType,
+        },
+        row,
+      });
+
+      if (reviewOutcome.review) {
+        console.log(
+          `[${sourceName}] LLM review status=${reviewOutcome.review.status} score=${reviewOutcome.review.risk_score} confidence=${reviewOutcome.review.confidence} changed=${reviewOutcome.review.changed_fields.join(",") || "none"}`
+        );
+      }
+
+      return reviewOutcome.row;
+    })
+  );
 
   console.log(`[${sourceName}] Done — ${results.length} result(s).`);
   return results;

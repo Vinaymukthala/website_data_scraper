@@ -1,3 +1,4 @@
+import './env/loadEnv.js';
 import express from 'express';
 import { scrapeFirearm } from './scraperService.js';
 

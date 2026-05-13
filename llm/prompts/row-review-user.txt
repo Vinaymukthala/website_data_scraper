@@ -1,0 +1,11 @@
+Review this firearm listing row.
+
+Decide:
+- `status`: `clean`, `warn`, or `suspicious`
+- `risk_score`: 0 to 5
+- `confidence`: 0 to 1
+- `reasons`: short machine-friendly reasons
+- `corrected`: repaired row fields
+- `changed_fields`: the specific field names changed
+
+Use the provided evidence only.

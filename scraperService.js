@@ -5,6 +5,7 @@
  *   scrapeFirearm(input) → { query, sources, offerValue, errors, _meta }
  */
 
+import "./env/loadEnv.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
